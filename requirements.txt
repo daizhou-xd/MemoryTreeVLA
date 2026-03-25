@@ -45,9 +45,6 @@ wandb>=0.16.0          # optional; remove if not using W&B
 # ---- Evaluation benchmarks ----
 # LIBERO
 # libero @ git+https://github.com/Lifelong-Robot-Learning/LIBERO.git
-# CALVIN (install from source, see README)
-# calvin_agent @ git+https://github.com/mees/calvin.git
-
 # ---- Development ----
 black>=24.0.0
 isort>=5.13.0

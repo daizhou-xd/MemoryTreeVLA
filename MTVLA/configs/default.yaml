@@ -97,12 +97,6 @@ pipeline:
         image_size: 224
         max_episode_steps: 300
       # Uncomment to add more datasets for Stage 2:
-      # - name: calvin
-      #   data_root: dataset/CALVIN/task_D_D
-      #   split: training
-      #   suite: D->D           # A->A | B->C | D->D
-      #   num_workers: 4
-      #   image_size: 200
       # - name: robomme
       #   data_root: dataset/RoboMME
       #   split: train
@@ -133,12 +127,6 @@ pipeline:
         num_workers: 4
         image_size: 224
         max_episode_steps: 300
-      # - name: calvin
-      #   data_root: dataset/CALVIN/task_D_D
-      #   split: training
-      #   suite: D->D
-      #   num_workers: 4
-      #   image_size: 200
       # - name: robomme
       #   data_root: dataset/RoboMME
       #   split: train

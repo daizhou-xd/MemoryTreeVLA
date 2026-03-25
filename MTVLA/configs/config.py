@@ -68,9 +68,9 @@ class TrainConfig:
 @dataclass
 class DatasetConfig:
     """Configuration for a single benchmark dataset."""
-    name: str = "robocerebra"          # robocerebra | libero | calvin | robomme
+    name: str = "robocerebra"          # robocerebra | libero | robomme
     data_root: str = "data/"
-    split: str = "train"               # train / val / test / D->D (CALVIN)
+    split: str = "train"               # train / val / test
     suite: str = "all"                 # LIBERO suite or ROBOMME category
     num_workers: int = 4
     image_size: int = 224

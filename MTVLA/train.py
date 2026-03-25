@@ -9,7 +9,7 @@ Three-stage training paradigm (CONSTRUCTION.md §4):
            Freezes : vision_mamba, task_tree_mamba, action_llm, action_head
 
   Stage 2  Fusion module + Action head joint training
-           Dataset : configurable — LIBERO / CALVIN / RoboMME (see YAML)
+           Dataset : configurable — LIBERO / RoboMME (see YAML)
            Trains  : multimodal_mamba, action_llm_proj, action_condition,
                      action_head
            Freezes : vision_mamba, task_tree_mamba, action_llm, tree_llm
@@ -80,7 +80,7 @@ logger = setup_logger("MTVLA-Train")
 # Dataset stubs
 # Each real integration should implement a proper Dataset class that:
 #   - reads task_description.json (RoboCerebra) or equivalent task definitions
-#   - loads observations from demo.hdf5 / LIBERO / CALVIN / RoboMME APIs
+#   - loads observations from demo.hdf5 / LIBERO / RoboMME APIs
 #   - returns the dict expected by _batch_to_device()
 # ---------------------------------------------------------------------------
 
@@ -212,10 +212,6 @@ class LiberoDataset(_DummyEpisodeDataset):
     """LIBERO dataset stub.  Replace body with actual libero.envs loader."""
 
 
-class CalvinDataset(_DummyEpisodeDataset):
-    """CALVIN dataset stub.  Replace body with actual calvin_agent loader."""
-
-
 class RoboMMEDataset(_DummyEpisodeDataset):
     """RoboMME dataset stub.  Replace body with actual RoboMME loader."""
 
@@ -223,7 +219,6 @@ class RoboMMEDataset(_DummyEpisodeDataset):
 _DATASET_REGISTRY = {
     "robocerebra": RoboCerebraDataset,
     "libero":      LiberoDataset,
-    "calvin":      CalvinDataset,
     "robomme":     RoboMMEDataset,
 }
 

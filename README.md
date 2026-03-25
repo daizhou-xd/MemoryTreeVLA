@@ -26,14 +26,8 @@ MemoryTreeVLA/
 │
 ├── LIBERO_evaluation/            # LIBERO benchmark evaluation
 │   ├── libero_evaluator.py
-│   ├── libero_client_4tasks.py
 │   ├── eval_libero.py
 │   └── configs/libero_eval.yaml
-│
-├── CALVIN_evaluation/            # CALVIN benchmark evaluation
-│   ├── calvin_evaluator.py
-│   ├── eval_calvin.py
-│   └── configs/calvin_eval.yaml
 │
 ├── ROBOMME_evaluation/           # RoboMME benchmark evaluation
 │   ├── robomme_evaluator.py
@@ -127,13 +121,6 @@ ds_report
 ```bash
 git clone https://github.com/Lifelong-Robot-Learning/LIBERO.git
 cd LIBERO && pip install -e . && cd ..
-```
-
-**CALVIN:**
-```bash
-cd /tmp
-git clone --recurse-submodules https://github.com/mees/calvin.git
-cd calvin && pip install -e . && cd -
 ```
 
 ### 6. Verify Full Installation
@@ -239,13 +226,10 @@ deepspeed --num_gpus=4 MTVLA/train.py \
 **LIBERO Evaluation:**
 ```bash
 conda activate mtvla
-python LIBERO_evaluation/eval_libero.py --model_ckpt outputs/checkpoint.pth --suite all
-```
-
-**CALVIN Evaluation:**
-```bash
-conda activate mtvla
-python CALVIN_evaluation/eval_calvin.py --model_ckpt outputs/checkpoint.pth --split D->D
+# Start inference server first
+python MTVLA/scripts/MTVLA_server.py --ckpt_dir outputs/stage3/ --port 9000
+# Then run evaluation
+python LIBERO_evaluation/eval_libero.py --server_url ws://localhost:9000 --suite all
 ```
 
 **RoboMME Evaluation:**

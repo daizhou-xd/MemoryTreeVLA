@@ -283,7 +283,6 @@ class CrossTreeSSM(nn.Module):
 |------|------|----------|
 | **RoboCereBraBench** | 长时程（平均 9.1 步/任务），含 Memory-Exploration / Memory-Execution / Random-Disturbance 模式 | 直接验证树状记忆的长时程规划能力与回溯机制 |
 | **LIBERO-Long** | 5步以上顺序操作任务 | 验证子任务切换的准确性 |
-| **CALVIN** | 连续 4 任务链 | 测试任务链滚动执行时树状态的稳定性 |
 | **MetaWorld MT-50** | 50类操作任务多样性评估 | 验证 Tree VLM 在不同任务类型下初始化树结构的泛化能力 |
 
 ### 7.2 消融实验设计
