@@ -1,0 +1,22 @@
+model:
+  name: MemoryTreeVLA
+  embed_dim: 512
+  action_dim: 7
+  max_depth: 4
+  backbone: openvla-7b
+  action_llm_path: checkpoints/Qwen2.5-0.5B
+  tree_llm_path:   checkpoints/Qwen2.5-1.5B-Instruct
+
+train:
+  batch_size: 32
+  lr: 1.0e-4
+  epochs: 50
+  warmup_steps: 1000
+  grad_clip: 1.0
+  output_dir: outputs/
+
+data:
+  dataset: robocerebra
+  data_root: dataset/RoboCerebra/RoboCerebra_trainset
+  num_workers: 4
+  image_size: 224

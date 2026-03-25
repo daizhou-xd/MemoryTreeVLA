@@ -1,0 +1,16 @@
+eval:
+  num_sequences: 1000
+  split: "D->D"          # Options: D->D | ABC->D | ABCD->D
+  record_video: false
+  result_dir: results/calvin/
+
+env:
+  image_size: 200
+  cameras:
+    - static
+    - gripper
+  obs_keys:
+    - rgb_obs
+    - depth_obs
+    - robot_obs
+  max_steps_per_subtask: 30

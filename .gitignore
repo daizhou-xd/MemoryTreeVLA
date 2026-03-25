@@ -1,0 +1,42 @@
+# ── Model checkpoints & downloaded weights ──────────────────────────
+checkpoints/
+
+# ── Datasets (large, downloaded separately) ──────────────────────────
+dataset/
+
+# ── Training outputs ─────────────────────────────────────────────────
+outputs/
+runs/
+wandb/
+logs/
+
+# ── Large file types (safety net for files > ~200 MB) ────────────────
+*.hdf5
+*.h5
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.ckpt
+*.pkl
+
+# ── Python ───────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+*.egg
+
+# ── Jupyter ──────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+
+# ── OS ───────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── IDE ──────────────────────────────────────────────────────────────
+.vscode/
+.idea/

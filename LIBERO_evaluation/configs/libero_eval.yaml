@@ -1,0 +1,19 @@
+eval:
+  num_episodes: 50
+  render: false
+  record_video: false
+  result_dir: results/libero/
+
+suites:
+  - LIBERO-Spatial
+  - LIBERO-Object
+  - LIBERO-Goal
+  - LIBERO-Long
+
+env:
+  image_size: 224
+  obs_keys:
+    - agentview_image
+    - robot0_eef_pos
+    - robot0_eef_quat
+    - robot0_gripper_qpos
