@@ -1,377 +1,890 @@
+﻿# MemoryTreeVLA — 论文框架构建文档
 
-# MemoryTreeVLA（暂名）: 基于记忆树的视觉-语言-动作模型
-
-## 1. 概述
-
-MemoryTreeVLA 是一种面向长时程机器人操控的新型架构，通过显式的**层次化任务树（Hierarchical Task Tree）**记忆机制，实现复杂多步骤任务的规划、执行与回溯。该架构主体借鉴 Evo-1 的轻量化 VLA 设计，并结合 BT-TL-DMPs 的行为树任务分解思想、RoboCerebra 的长时程子任务标注方式，以及 GrootVL 的树状扫描状态空间模型（SSM），构建了一个具备长程推理能力的 VLA 系统。与上一版不同的是，**动作生成路径不再依赖 Action LLM**，而是直接将 Multimodal Mamba 输出的融合 token 序列作为动作头条件输入。
+> **版本**: v0.1 · **日期**: 2026-03-31  
+> **状态**: 交互讨论草稿，欢迎随时提出修改意见
 
 ---
 
-## 2. 核心架构
+## 一、论文定位与标题候选
 
-### 2.1 修正后的整体架构图
+### 问题动机
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                    MemoryTreeVLA Architecture (Updated)                     │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│   Input Layer                                                               │
-│   ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐          │
-│   │   Visual Input   │  │    Tree.json     │  │   Robot State    │          │
-│   │  (Camera Image)  │  │  (Subtask State) │  │  (Joint / EEF)   │          │
-│   └────────┬─────────┘  └────────┬─────────┘  └────────┬─────────┘          │
-│            │                     │                     │                    │
-│   Modality-Specific Encoders / Projectors                                   │
-│            ▼                     ▼                     ▼                    │
-│   ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐          │
-│   │  Vision Mamba    │  │   Tree Mamba     │  │  State Projector │          │
-│   │  (Tree Scan)     │  │    (Tree Scan)   │  │  (Linear / MLP)  │          │
-│   │  Output: Z_v     │  │  Output: Z_t     │  │  Output: Z_s     │          │
-│   └────────┬─────────┘  └────────┬─────────┘  └────────┬─────────┘          │
-│            │                     │                     │                    │
-│   Multimodal Fusion                                                         │
-│            └──────────────┬──────┴─────────────────────┘                    │
-│                           ▼                                                  │
-│              ┌──────────────────────┐                                        │
-│              │   Multimodal Mamba   │                                        │
-│              │  (Cross-Modal Fuse)  │                                        │
-│              │ Input: [Z_v, Z_t, Z_s]│                                       │
-│              │  Output: Z_fused     │                                        │
-│              └──────────┬───────────┘                                        │
-│                         │                                                   │
-│   Action Generation                                                         │
-│                         ▼                                                   │
-│   ┌──────────────────────────────────────────────────┐                      │
-│   │          Action Head (Diffusion / Flow / MLP)    │                      │
-│   │  Condition: Z_fused Token Sequence               │                      │
-│   │  Output: Action Sequence (End-effector Pose)     │                      │
-│   └──────────────────────────────────────────────────┘                      │
-│                                                                             │
-│   ═══════════════════════════════════════════════════════════════════       │
-│                                                                             │
-│   Tree Management                                                           │
-│   ┌──────────────────────────────────────────────────┐                      │
-│   │              Tree LLM (Trainable)                │                      │
-│   │  Input: Z_v (Visual Features) + Current Tree     │                      │
-│   │  Output: Updated Tree.json                       │                      │
-│   │  Function: Subtask completion detection          │                      │
-│   └──────────────────────────────────────────────────┘                      │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+当前 VLA（Vision-Language-Action）模型在**超长程任务**（long-horizon tasks）上存在两大根本缺陷：
 
-### 2.2 Tree LLM + 多模态融合设计
+1. **无结构记忆**：以往方法（如 RoboMamba、OpenVLA）仅靠固定长度窗口的 token 序列表示历史，无法有效保留跨阶段的因果关系与分层语义；缺乏对"重要子任务节点"的强化保留机制。
+2. **视觉编码语义盲区**：ViT 的规则 patch 扫描对任务无关区域投入等同注意力，导致高分辨率图像推理中存在大量冗余，且无法动态聚焦任务相关区域。
 
-> **架构说明**：视觉编码完全由 Vision Mamba 负责（GrootVL 树状扫描），**不使用 ViT 等视觉骨干**。系统中仅保留 **Tree LLM** 负责任务树初始化与更新；动作分支不再经过 LLM，而是由 **Multimodal Mamba 的融合 token 序列直接条件化动作头**。
+### 标题候选
 
-| 组件 | 功能定位 | 输入 | 输出 | 架构细节 |
-|------|----------|------|------|----------|
-| **Vision Mamba** | 视觉时序编码（替代 ViT） | 图像序列 $I_t$ | 视觉特征 $Z_v \in \mathbb{R}^{T \times D}$ | GrootVL 树状扫描 SSM，无需预训练视觉骨干 |
-| **Tree Mamba** | 结构化任务编码 | Tree.json | 树特征 $Z_t \in \mathbb{R}^{N \times D}$ | 将层次化树结构线性化为序列，保留父子关系 |
-| **State Projector** | 机器人状态编码 | 关节角度 / 末端执行器位姿向量 $s_t$ | 状态 token $Z_s \in \mathbb{R}^{1 \times D}$（或少量 tokens） | 轻量 Linear / MLP 投影，将低维状态向量映射到与 $Z_v, Z_t$ 相同的 token 维度 |
-| **Multimodal Mamba** | **跨模态融合** | $[Z_v; Z_t; Z_s]$ | 融合特征 $Z_{fused} \in \mathbb{R}^{L \times D}$ | **核心创新**：通过选择性 SSM 实现视觉-任务-状态动态对齐；$Z_s$ 充当即时执行状态锚点 |
-| **Action Head** | 动作生成 | $Z_{fused}$ token 序列 | 动作序列 $a_{1:H}$ | 扩散 / Flow Matching / MLP 头；直接把融合 tokens 作为条件上下文 |
-| **Tree LLM** | 任务管理 | $Z_v$（投影）+ Tree 文本描述 | 更新后的 Tree.json | **Qwen2.5-1.5B-Instruct**；低频调用，Instruct 版保证 JSON 格式稳定，推理能力更强 |
+| 候选标题 | 侧重点 |
+|---|---|
+| **MemoryTreeVLA: Hierarchical Memory Trees with Semantic-Guided Mamba Scanning for Long-Horizon Robot Manipulation** | 全面，适合主会 |
+| **Growing Memory: Tree-Structured Episodic Representations for Long-Horizon Robotic VLA** | 记忆树为主 |
+| **TreeScan-VLA: Minimum Spanning Tree Mamba Encoding for Semantic-Aware Robot Manipulation** | SGMTS 为主 |
 
-**关键数据流**：
-
-| 路径 | 流向 |
-|------|------|
-| 视觉模态 | `Image` →(Vision Mamba)→ `Z_v` →(Concat)→ `Multimodal Mamba` → `Z_fused` |
-| 树模态 | `Tree.json` →(Tree Mamba)→ `Z_t` →(Concat)→ `Multimodal Mamba` → `Z_fused` |
-| 状态模态 | `RobotState` $s_t$ →(State Projector)→ `Z_s` →(Concat)→ `Multimodal Mamba` → `Z_fused` |
-| 动作条件路径 | `Z_fused` → `Action Head`（作为条件 token 序列）→ `Action Sequence` |
-| Tree LLM 输入 | `Z_v` →(Linear Projector)→ `v_tokens` + Tree 文本序列化 → Tree LLM |
+> **推荐**: 第一个（全称），可根据投稿会议再精炼。
 
 ---
 
-## 3. 关键技术：Multimodal Mamba 设计
+## 二、整体架构概览
 
-### 3.1 架构动机
-传统的多模态融合（如简单的 Concat + Linear 或 Cross-Attention）难以处理视觉时序与任务树结构之间的**动态跨模态依赖**。Multimodal Mamba 利用状态空间模型（SSM）的选择性机制，实现：
-1. **时序对齐**：视觉动态与子任务进度的时序同步
-2. **选择性关注**：根据当前子任务类型，动态关注视觉特征的相关区域
-3. **长程依赖**：跨越多子任务的长时程记忆保持
+```
+输入: 任务语言描述 ℓ + 当前图像 I_t + 关节状态 q_t
+                        │
+           ┌────────────┼────────────┐
+           ▼            ▼            ▼
+      [SGMTS模块]  [记忆树读取]  [本体感知编码]
+       视觉Token     记忆Token     关节Token
+        Z^V           Z^M           e^Q
+           │            │            │
+           └────────────┼────────────┘
+                        ▼
+                 [层次跨模态融合]
+                    Z^fused
+                        │
+                        ▼
+                [Qwen2.5 LLM]
+                        │
+                        ▼
+                  [动作生成头]
+                     a_t
+                        │
+                        ▼
+              [记忆树更新模块] ←── 写回新节点 v_t
+```
 
-### 3.2 融合策略细节
+---
 
-**跨树选择性机制**：以任务树特征的全局均值作为条件信号，对视觉特征进行残差门控，动态调节视觉与树信息的融合比例；再将门控后的视觉 tokens 与树 tokens 拼接为统一序列，经多层 Mamba SSM 处理后输出 `Z_fused`。
+## 三、核心创新一：层次记忆树（Hierarchical Memory Tree, HMT）
 
-**机器人状态融合**：将当前时间步的关节角度、末端执行器位姿（6-DoF）等低维状态向量 $s_t \in \mathbb{R}^{d_s}$ 通过 State Projector（线性层或 2 层 MLP）映射为 $Z_s \in \mathbb{R}^{1 \times D}$（或少量 tokens），与 $Z_v$、$Z_t$ 一同拼接后送入 Multimodal Mamba。$Z_s$ 充当即时执行状态锚点，使融合上下文同时感知视觉场景、子任务进度和机器人当前构型，有效减少 Action Head 对系统状态估计的歧义。
+### 3.1 理论动机
 
-**统一树状扫描**：视觉树与任务树作为同一超图的子树，构建基于语义相似度的跨树连接矩阵，采用交替扫描（intra-tree → inter-tree → intra-tree）的方式统一处理两棵树的结构信息。
+生物记忆研究表明，情景记忆（episodic memory）以层次化、因果树状结构组织——重要事件被强化，无关细节被遗忘，高层语义对低层细节进行抽象。我们将这一机制引入机械臂操控的历史建模中。
 
-### 3.3 基于 GrootVL 代码的扫描实现思路
+### 3.2 节点定义
 
-这一部分基于仓库中的 `MTVLA/models/tree_scan` 实现整理，而不是只基于论文文字描述。需要强调的是：**GrootVL 原始代码核心对应的是图像特征上的树状扫描；task tree 扫描是本仓库将同一套 Tree-SSM 递推迁移到显式任务树拓扑后的实现。**
-
-#### 图像扫描的大致思路（Vision Mamba / GrootVL 风格）
-
-1. **先把图像变成局部 patch 特征图**：`StemLayer` 用两层 stride-2 卷积把输入图像降到 $1/4$ 分辨率，得到 $(B, H, W, C)$ 特征图。
-2. **按 4-邻域建立网格图**：把每个 patch 当成一个节点，只连接上下左右相邻 patch，形成规则网格边集。
-3. **根据当前层特征自适应计算边权**：`MinimumSpanningTree` 对相邻 patch 计算余弦相似度（或 L2 距离），再映射成 MST 使用的边权。这一步依赖当前层特征，所以**每一层的树结构都可能不同**。
-4. **构建最小生成树（MST）**：对每个样本分别运行 Kruskal，保留最能反映局部语义连通性的 $L-1$ 条边，把二维网格压缩成一棵树。
-5. **将树线性化为 BFS 顺序**：从根节点开始做 BFS，得到 `sorted_index` 和 `sorted_parent`。前者表示“第 $t$ 个访问到的节点是谁”，后者表示“该节点的父节点在 BFS 序列中的位置”。
-6. **沿 BFS 顺序做 Tree-SSM 递推**：`tree_scanning()` 先从输入特征中投影出 $\Delta, B, C$ 等 SSM 参数，再对每个节点执行
+时刻 $t$ 的记忆树 $\mathcal{T}_t$ 中，每个节点 $v_i$ 存储一个**六元组**：
 
 $$
-h_i = dA_i \cdot h_{parent(i)} + dB_i \cdot x_i
+v_i = \left(\mathbf{z}_i^v,\;\mathbf{A}_i,\;\mathbf{q}_i,\;\mathbf{s}_i,\;n_i,\;w_i\right)
 $$
 
-因为按 BFS 扫描，所以父节点一定已经被处理过，递推可以顺序完成。
+| 符号 | 含义 | 维度 |
+|---|---|---|
+| $\mathbf{z}_i^v$ | 视觉嵌入的**在线均值**（滚动更新） | $\mathbb{R}^d$ |
+| $\mathbf{A}_i$ | 本节点所有时间步动作的**有序列表** | $(\mathbb{R}^{d_a})^{n_i}$ |
+| $\mathbf{q}_i$ | 最近时刻的关节状态（滚动更新） | $\mathbb{R}^{d_q}$ |
+| $\mathbf{s}_i$ | 语义嵌入的**在线均值**（可随层提升后固化） | $\mathbb{R}^d$ |
+| $n_i$ | 融合入本节点的时间步计数 | $\mathbb{Z}^+$ |
+| $w_i$ | 记忆重要性权重（含时长信号） | $\mathbb{R}^+$ |
 
-7. **读出并回到残差块**：得到隐藏状态后，再按
+> SSM 读取时取 $\mathbf{a}_i = \mathbf{A}_i[-1]$（最近动作）作为代表动作。
+
+### 3.3 树的动态构建——三路插入决策
+
+#### 语义距离与新时刻语义初始化
 
 $$
-y_i = h_i \cdot C_i + D \cdot x_i
+d_{\text{sem}}(\mathbf{s}_i, \mathbf{s}_j) = 1 - \frac{\mathbf{s}_i \cdot \mathbf{s}_j}{\|\mathbf{s}_i\|\|\mathbf{s}_j\|} \in [0,2]
 $$
 
-生成输出，经过归一化、门控和 MLP 残差块，形成下一层视觉特征。
+$$
+\mathbf{s}_t = \text{MLP}_{\text{sem}}\!\left([\mathbf{z}_t^v;\, \mathbf{g}]\right), \qquad \mathbf{g} = \text{TextEnc}(\ell)
+$$
 
-**直观理解**：GrootVL 不是把图像硬编码成行优先或列优先序列，而是让当前特征自己决定“哪些 patch 更应该先通过树连接起来”，再沿这棵输入自适应的树传播状态。
+设当前"活跃节点"为 $v_{\text{act}}$（最近一次被创建或更新的节点），计算：
 
-#### Task Tree 扫描的大致思路（本仓库对 GrootVL 递推的迁移）
+$$
+d_t = d_{\text{sem}}\!\left(\mathbf{s}_t,\;\mathbf{s}_{\text{act}}\right)
+$$
 
-1. **输入不是图像网格，而是显式任务树**：`Tree.json` 中已经给出了父子层级，因此不需要像图像那样再从相似度构建 MST。
-2. **把任务树转成 parent map**：每个节点记录 `node_id -> parent_id`，根节点的父节点为空。
-3. **预先计算并缓存 BFS 拓扑**：`build_bfs_from_adj()` 从根节点出发生成 `sorted_index` 和 `sorted_parent`。与视觉分支不同，这个 BFS 顺序只要任务树不变，就可以跨时间步复用。
-4. **节点特征进入 TreeMambaLayer**：节点特征可以由子任务文本、状态嵌入、历史 token 记忆等组成，输入形状为 $(B, N, D)$。
-5. **复用同一套标量 Tree-SSM 递推**：`TreeMambaLayer` 与视觉分支一样，先为每个节点生成 $\Delta, B, C$，再按 BFS 顺序执行父到子的递推：父节点隐藏状态直接影响子节点更新。
-6. **叠加多层残差块形成上下文化树表示**：多层 TreeMamba 后，每个节点的表示都带有来自祖先链、兄弟执行上下文和树深度结构的信息，最终输出为 $Z_t$。
+以阈值 $\theta_{\text{fuse}} \in (0,2)$ 为界，依据 $d_t$ 执行**二路决策**：
 
-**直观理解**：图像扫描是“先从特征里长出一棵树，再扫描”；task tree 扫描是“树已经存在，直接沿显式拓扑扫描”。两者共享的核心不是建树方式，而是**沿树拓扑做选择性 SSM 状态传播**这一递推原语。
+$$
+\boxed{\text{Decision}(d_t) = \begin{cases}
+\textbf{(A) 融合更新} & d_t < \theta_{\text{fuse}} \\
+\textbf{(B) 分支创建} & d_t \geq \theta_{\text{fuse}}
+\end{cases}}
+$$
 
----
-
-## 4. 训练策略（三阶段修正版）
-
-基于 RoboCerebraBench  的高质量子任务标注数据：
-
-### 第一阶段：Tree LLM + Multimodal Mamba 基础训练
-- **目标**：建立视觉-树-动作的基础关联
-- **训练对象**：Tree LLM 独立训练；Multimodal Mamba 使用对比学习预训练（对齐视觉与树特征空间）
-- **数据**：RoboCerebraBench 子任务标注（平均 9.1 步/任务）
-
-### 第二阶段：动作头与融合模块联合训练
-- **目标**：优化跨模态融合到动作的映射
-- **设置**：
-  - 冻结：Vision Mamba, Tree Mamba, Tree LLM
-  - 训练：**State Projector** + **Multimodal Mamba** + Action Head
-- **损失函数**：动作重建损失 + 融合特征对齐损失
-- **说明**：该阶段不再需要 Action LLM 蒸馏或 token 自回归目标，而是直接学习从 $Z_{fused}$（含 $Z_s$）token 序列到连续动作的条件映射；State Projector 从随机初始化开始随 Multimodal Mamba 一起训练
-
-### 第三阶段：端到端全量微调
-- **目标**：整体架构适应端到端任务执行
-- **设置**：
-  - 解冻：Multimodal Mamba（部分层）, State Projector, Action Head
-  - 可选解冻：Tree LLM（若需要提升子任务完成检测与树更新鲁棒性）
-  - 冻结：Vision Mamba（保留通用视觉特征）
-  - 学习率分层：Tree LLM (1e-5，可选) < Multimodal Mamba (5e-5) < State Projector / Action Head (1e-4)
+两个区间的语义对应：**A** = 同一语义阶段持续（如"持续施力拧螺丝"），当前观测与活跃节点在同一语义邻域内；**B** = 可辨别的语义跳变（子任务切换，如"抓取→放置"），需要在树中新建节点以标记这一转折。层次化的抽象结构由语义提升操作（操作②）主动构建，而非依赖顺序插入形成的线性链。
 
 ---
 
-## 5. 推理流程（修正版）
+#### 决策 A — 融合更新（Merge Update）
 
-### 5.1 标准执行流程（含多模态融合）
+$d_t < \theta_{\text{fuse}}$，机器人处于与活跃节点**相同的语义状态**，就地更新 $v_{\text{act}}$，**不创建新节点**：
 
-```
-1. 初始化阶段
-   └─> Tree LLM 根据初始视觉图像初始化 Tree.json
-       └─> 生成完整子任务序列与初始状态
+**在线均值更新**（Welford 递推，无偏估计）：
 
-2. 执行循环（每个时间步 t）
-   ├─> 视觉编码：Image_t → Vision Mamba → Z_v (Visual Tokens)
-   ├─> 树编码：Tree.json → Tree Mamba → Z_t (Tree Tokens)
-   ├─> 状态编码：RobotState s_t → State Projector → Z_s (State Token)
-   ├─> 关键步骤：Multimodal Mamba 融合
-   │   └─> Input: Concat[Z_v, Z_t, Z_s]
-   │   └─> Process: 跨模态选择性 SSM 处理（视觉 + 任务树 + 机器人状态）
-   │   └─> Output: Z_fused (Fused Representation)
-   ├─> 动作头条件化：Z_fused 直接作为条件 token 序列输入 Action Head
-   ├─> 动作头输出：Action Sequence (Δt 时域动作)
-   ├─> 执行动作并观察状态变化
-   └─> 子任务完成检测？
-     ├─> 是：将当前融合 token 摘要或动作条件状态存入 Tree.json 对应子任务节点
-     │       Tree LLM 更新子任务状态，激活下一子任务
-       └─> 否：继续当前子任务执行
+$$
+n_{\text{act}} \leftarrow n_{\text{act}} + 1
+$$
 
-3. 任务完成：所有子任务状态为 completed，输出 success
-```
+$$
+\mathbf{z}_{\text{act}}^v \;\leftarrow\; \mathbf{z}_{\text{act}}^v + \frac{\mathbf{z}_t^v - \mathbf{z}_{\text{act}}^v}{n_{\text{act}}}, \qquad
+\mathbf{s}_{\text{act}} \;\leftarrow\; \mathbf{s}_{\text{act}} + \frac{\mathbf{s}_t - \mathbf{s}_{\text{act}}}{n_{\text{act}}}
+$$
 
-### 5.2 回溯机制（利用融合上下文）
+**关节状态与动作追加**：
 
-```
-回溯触发条件：
-暂未定义明确触发条件，计划在后续版本中基于失败子任务的特征（如连续失败次数、视觉-树特征不匹配度）设计动态触发机制
+$$
+\mathbf{q}_{\text{act}} \leftarrow \mathbf{q}_t, \qquad \mathbf{A}_{\text{act}} \leftarrow \mathbf{A}_{\text{act}} \;\|\; [\mathbf{a}_t]
+$$
 
-回溯流程：
-1. 读取 Tree.json 中的 backtrack_pointer
-2. **关键**：从 Tree.json 加载上一成功子任务缓存的融合 token 摘要 / 条件状态
-3. 重新构建 Z_t（上一子任务状态）并与当前视觉 Z_v 送入 Multimodal Mamba
-4. 生成融合特征 Z_fused^backtrack，包含"回溯上下文"
-5. Action Head 基于 Z_fused^backtrack 直接生成修正动作
-6. Tree LLM 重置当前子任务状态，重置 failure_count
-```
+**权重增量**（时长信号：在此语义状态停留越久，节点越重要）：
 
-**回溯中的多模态优势**：Multimodal Mamba 在回溯时能动态调节视觉与历史任务记忆的权重，例如当重新执行 "reach" 时，更关注当前视觉中的物体位置而非历史树状态。
+$$
+\boxed{w_{\text{act}} \leftarrow w_{\text{act}} + \delta_w}
+$$
+
+活跃节点 $v_{\text{act}}$ 保持不变，树结构不生长。
+
+> **自保持性分析**：每步融合满足 $d_t < \theta_{\text{fuse}}$，EMA 步长 $1/n_{\text{act}}$ 随访问次数单调递减，语义中心漂移速率为 $O(1/n)$，语义嵌入被"锚定"在语义邻域内，不会无限漂移。
+>
+> **与 SSM 的自然耦合**：融合次数多 → $w_i$ 高 → $\Delta_i$ 大（见 3.5 节）→ 稳定长阶段的记忆在树递推中衰减最慢，这一机制完全自动涌现，无需额外设计。
 
 ---
 
-## 6. 技术优势分析
+#### 决策 B — 分支创建（Branch Split）
 
-### 6.1 Multimodal Mamba 的核心价值
+$d_t \geq \theta_{\text{fuse}}$，发生**语义跳变**。沿祖先链向上寻找语义最近的"最优分叉点"：
 
-1. **动态跨模态注意力**：相比 Transformer 的静态 Cross-Attention，SSM 的选择性机制允许根据当前子任务动态调整视觉与树信息的融合比例
+$$
+v_{\text{anc}}^* = \underset{v_k \in \mathcal{A}(v_{\text{act}}) \cup \{v_{\text{act}}\}}{\arg\min}\; d_{\text{sem}}(\mathbf{s}_t, \mathbf{s}_k)
+$$
 
-2. **计算效率**：Mamba 的线性复杂度 $O(L)$ 使长时程任务（RoboCerebra 中长达 20 步）的融合计算可行，而 Transformer 的 $O(L^2)$ 在 $L = T + N$ 较大时开销过高
+$$
+\text{par}(v_t) \leftarrow v_{\text{anc}}^*, \qquad v_{\text{act}} \leftarrow v_t
+$$
 
-3. **时序-结构统一建模**：视觉时序（连续）与任务树（离散层次）在 SSM 的统一状态转移框架下融合，避免了模态间语义鸿沟
-
-### 6.2 与现有方案对比
-
-| 方案 | 长时程记忆 | 任务回溯 | 多模态融合策略 | 计算复杂度 | VLA集成 |
-|------|-----------|---------|--------------|-----------|--------|
-| **MemoryTreeVLA（本文）** | ✅ 显式树状记忆 | ✅ 指针式回溯 | Tree-guided SSM 门控融合 + 直接条件化动作头 | $O(L)$ | ✅ 轻量化 Mamba-VLA 主干 |
-| RoboCerebra (System 2) | ✅ 内存库(Memory Bank) | ❌ 无结构化回溯 | VLM轮询（离散切换） | $O(L^2)$ | ✅ 外部VLM + VLA控制器 |
-| BT-TL-DMPs | ✅ 行为树状态机 | ✅ BT反应性恢复 | 符号推理（无神经融合） | 符号求解 | ❌ 基于DMP，非端到端 |
-| GrootVL | ❌ 无任务记忆 | ❌ | 树状SSM（单模态） | $O(L)$ | ❌ 视觉/文本骨干，非VLA |
-| Evo-1 | ❌ 无长时程机制 | ❌ | 集成模块 + 扩散Action Head | $O(L^2)$ | ✅ 轻量化0.77B VLA |
-| OpenVLA / $\pi_0$ | ❌ | ❌ | Token拼接 | $O(L^2)$ | ✅ 大模型VLA |
-
-**核心差异化优势**：
-1. **结构化记忆 vs 隐式记忆**：RoboCerebra 的 Memory Bank 是扁平化 key-value 存储，MemoryTreeVLA 的 Tree.json 保留了子任务的**层次依赖关系**，可以做有约束的回溯（仅回到父节点，而非任意跳转）。
-2. **神经-符号融合**：BT-TL-DMPs 在符号层（STL→BT）做任务结构，而 MemoryTreeVLA 将树结构**嵌入神经特征空间**，通过 Tree Mamba 和 Multimodal Mamba 实现端到端可微分优化。
-3. **轻量化设计**：动作分支移除了高频调用的 Action LLM，在线控制路径变为 Vision/Tree Mamba → Multimodal Mamba → Action Head，相比显式自回归动作生成更适合实时闭环控制。
+分支创建后，若 $v_{\text{anc}}^*$ 的子节点数达到触发阈值 $K_{\text{elev}}$，立即执行一次**语义提升**（操作②）。
 
 ---
 
-## 7. 实验与评估建议
+#### 训练时梯度可微化（Soft Gating）
 
-### 7.1 基准测试选择
+硬阈值切换在反向传播中断梯度（离散决策）。训练阶段改用软门控：
 
-对标 RoboCerebra 的评估协议，建议在以下基准上验证 MemoryTreeVLA：
+$$
+\mu_t = \sigma\!\left(\frac{\theta_{\text{fuse}} - d_t}{\tau}\right) \in (0,1)
+$$
 
-| 基准 | 特性 | 适配理由 |
-|------|------|----------|
-| **RoboCereBraBench** | 长时程（平均 9.1 步/任务），含 Memory-Exploration / Memory-Execution / Random-Disturbance 模式 | 直接验证树状记忆的长时程规划能力与回溯机制 |
-| **LIBERO**（Spatial / Object / Goal / Long） | 四类任务套组，涵盖空间关系、物体操作、目标导向与长时程序列 | 验证跨任务类型的子任务切换准确性与动作头泛化能力 |
-| **RoboMME** | 多模态机器人操控评估基准，含丰富的场景与语义多样性 | 验证 Tree LLM 对多样化任务描述的树结构初始化与执行鲁棒性 |
+视觉嵌入的软更新（融合与新建并行计算，加权混合）：
 
-### 7.2 消融实验设计
+$$
+\tilde{\mathbf{z}}_{\text{out}} = \mu_t \cdot \underbrace{\left(\mathbf{z}_{\text{act}}^v + \frac{\mathbf{z}_t^v - \mathbf{z}_{\text{act}}^v}{n_{\text{act}}+1}\right)}_{\text{融合路径}} + (1-\mu_t) \cdot \underbrace{\mathbf{z}_t^v}_{\text{新节点路径}}
+$$
 
-建议围绕三个核心设计进行消融：
+梯度经 $\mu_t$（可用 straight-through estimator）和 $\mathbf{z}_t^v$ 正常回传。推理时令 $\tau \to 0^+$ 退化为硬决策。
+
+### 3.4 四种树操作
+
+#### 操作 ① — 记忆强化（Memory Reinforcement）
+
+记忆强化模拟人类"用进废退"效应，通过**访问频率追踪**、**梯度驱动重要性更新**和**任务相关表示更新**三维机制，提升关键经验的保留与检索效率。
+
+**（a）访问频率追踪**
+
+访问计数器 $n_{\text{access}}$ 在节点 6-元组中作为 $n_i$ 字段维护，每次检索或在 3.3 节的融合更新中命中该节点时递增：
+
+$$
+n_i \leftarrow n_i + 1
+$$
+
+**（b）梯度驱动的重要性加权更新**
+
+节点 $v_C$ 的重要性权重 $w_C$ 依据其对当前任务损失的贡献自动调整——梯度幅度大的节点表明其表示对当前预测影响显著，应予以强化：
+
+$$
+\boxed{w_C^{\text{new}} = w_C + \eta \cdot \|\nabla_{\Phi_C} L_{\text{task}}\|_2 \cdot \mathbf{1}\!\left[\|\nabla_{\Phi_C} L_{\text{task}}\|_2 > \theta_{\text{grad}}\right]}
+$$
+
+其中 $\Phi_C$ 为节点 $v_C$ 的可微分嵌入参数（即 $\mathbf{z}_C^v$ 和 $\mathbf{s}_C$），$\eta$ 为权重更新步长，$\theta_{\text{grad}}$ 为梯度阈值（过滤噪声节点）。该机制在每次 episode 的反向传播后执行，无需额外奖励信号即可自动识别对任务成功至关重要的记忆片段。
+
+**（c）任务相关采样的节点表示更新**
+
+节点表示采用**指数移动平均（EMA）与任务相关采样**相结合的方式更新，确保更新方向与当前任务需求一致：
+
+$$
+\boxed{\Phi_C^{\text{new}} = (1 - \alpha_{\text{ema}}) \cdot \Phi_C + \alpha_{\text{ema}} \cdot \frac{\displaystyle\sum_{i \in \text{batch}} w_i^{\text{task}} \cdot \Phi_i}{\displaystyle\sum_{i \in \text{batch}} w_i^{\text{task}}}}
+$$
+
+其中任务相关采样权重为：
+
+$$
+w_i^{\text{task}} = \exp\!\left(\frac{\text{sim}(\Phi_i,\, \Phi_{\text{query}})}{\tau_{\text{task}}}\right)
+$$
+
+$\Phi_{\text{query}}$ 为当前时间步的查询嵌入（由当前视觉观测与语言指令融合得到），$\tau_{\text{task}}$ 为温度系数，$\alpha_{\text{ema}} \in (0,1)$ 控制历史与当前 batch 的混合比例。
+
+#### 操作 ② — 语义提升（Semantic Elevation）
+
+**动机**：随着多次分支创建，某个节点 $v_p$ 会积累多个子节点，这些子节点代表在 $v_p$ 语义基础上衍生出的不同子阶段。当子节点数量达到阈值 $K_{\text{elev}}$ 时，说明 $v_p$ 下的子阶段已足够丰富，适合引入一层新的抽象。语义提升操作通过**新建一个抽象父节点 $v_{\text{abs}}$**，将 $v_p$ 的部分子节点归并到其下，在树中主动插入更高层次的语义抽象，使树形成真正的层次结构而非扁平分叉。
+
+**触发条件**：$|\text{ch}(v_p)| \geq K_{\text{elev}}$
+
+**操作流程**：
+
+① 对 $v_p$ 的子节点集合 $\text{ch}(v_p) = \{v_1, \ldots, v_K\}$ 按语义相似度聚类，选出语义最集中的一个子集 $\mathcal{G} \subseteq \text{ch}(v_p)$
+
+$$
+\mathcal{G} = \underset{S \subseteq \text{ch}(v_p),\;|S|=\lfloor K/2 \rfloor}{\arg\max} \sum_{v_i \in S} w_i
+$$
+
+② 创建新抽象节点 $v_{\text{abs}}$，其语义嵌入由 $\mathcal{G}$ 中节点加权聚合生成：
+
+$$
+\mathbf{s}_{\text{abs}} = \text{MLP}_{\text{elev}}\!\left(\frac{\sum_{v_i \in \mathcal{G}} w_i\,[\mathbf{z}_i^v;\,\mathbf{s}_i]}{\sum_{v_i \in \mathcal{G}} w_i}\right)
+$$
+
+$$
+w_{\text{abs}} = \sum_{v_i \in \mathcal{G}} w_i, \qquad n_{\text{abs}} = \sum_{v_i \in \mathcal{G}} n_i
+$$
+
+其余字段取 $\mathcal{G}$ 中权重最大节点的 $\mathbf{z}^v$ 和 $\mathbf{q}$ 作为 $v_{\text{abs}}$ 的初始值。
+
+③ 将 $v_{\text{abs}}$ 插入 $v_p$ 与 $\mathcal{G}$ 之间：
+
+$$
+\text{par}(v_{\text{abs}}) \leftarrow v_p, \qquad \forall v_i \in \mathcal{G}:\;\text{par}(v_i) \leftarrow v_{\text{abs}}
+$$
+
+$v_p$ 的子节点集合中 $\mathcal{G}$ 的位置被 $v_{\text{abs}}$ 替代，$\mathcal{G}$ 的成员深度各增加 1。
+
+**结构效果**：
 
 ```
-A. 记忆树结构消融
-   - MemoryTreeVLA-full：完整树记忆 + 回溯
-   - MemoryTreeVLA-flat：将树退化为扁平列表（等价于 RoboCerebra Memory Bank）
-   - MemoryTreeVLA-no-memory：无历史记忆（纯 reactive VLA）
-   → 验证树结构相对扁平记忆的优势
-
-B. 多模态融合模块消融
-   - w/ Multimodal Mamba（本文）
-   - w/ Cross-Attention 替换 Multimodal Mamba
-   - w/ Concat + Linear 简单融合
-   → 验证树状 SSM 融合的效果与计算效率权衡
-
-C. 回溯机制消融
-   - w/ backtrack（指针式回溯）
-   - w/ restart（从头重新执行，BT-TL-DMPs 风格）
-   - w/o backtrack（不触发回溯）
-   → 验证指针式回溯相对全局重置的效率优势
+提升前:          提升后（新建 v_abs）:
+   v_p              v_p
+  ╱│╲              ╱  ╲
+v1 v2 v3         v_abs  v3
+                 ╱   ╲
+               v1     v2
 ```
 
-### 7.3 评估指标
+深度增加一层，$v_{\text{abs}}$ 成为 $\{v_1, v_2\}$ 的语义章节标题，而 $v_3$（语义差异较大）继续挂在 $v_p$ 下等待下次提升或分组。
 
-- **成功率（SR）**：任务完整完成（所有叶子节点 `completed`）
-- **子任务精度（Sub-SR）**：每个子任务的独立完成率，衡量树状态的准确性
-- **回溯利用率**：成功案例中触发回溯后最终成功的比例
-- **推理延迟**：每步动作生成时间（目标参考 Evo-1 实测 ≥ 15 Hz）
-- **树状态准确率（Tree-Acc）**：Tree LLM 判断子任务完成状态的 F1 分数（对比人工标注）
+#### 操作 ③ — 剪枝（Pruning）
 
-### 7.4 与 RoboCerebra 基线的对比设置
+定期扫描记忆树，将**不重要且没有子节点**的叶节点删除，防止树无限膨胀。满足以下两个条件的节点会被移除：
 
-RoboCerebra 提出的 System 1–System 2 交互框架以 VLM 轮询方式检测子目标完成，属于**离散式监控**。MemoryTreeVLA 的 Tree LLM 以**每步视觉观测**为输入做连续检测，可以在 RoboCerebra 的三种任务模式（Memory Exploration、Memory Execution、Random Disturbance）下分别对比：
-- **Memory-Exploration**：测试树结构对未见区域的预测性覆盖能力
-- **Memory-Execution**：核心测试场景，验证树导引下的精准执行
-- **Random-Disturbance**：验证回溯机制在随机干扰下的鲁棒恢复能力
+- **条件一**：$w_i < \theta_w$，即该节点的重要性权重低于阈值（长期未被用到、对任务贡献小）
+- **条件二**：$\text{isLeaf}(v_i)$，即该节点是叶节点（删除中间节点会断开子树，因此只删叶节点）
+
+用集合符号描述为——将当前树 $\mathcal{T}_t$ 中所有满足上述两个条件的节点 $v_i$ 从树中移除，得到更新后的树：
+
+$$
+\boxed{\mathcal{T}_t \;\leftarrow\; \mathcal{T}_t \;\setminus\; \bigl\{\,v_i \;:\; \underbrace{w_i < \theta_w}_{\text{权重太低}} \;\wedge\; \underbrace{\text{isLeaf}(v_i)}_{\text{是叶节点}}\,\bigr\}}
+$$
+
+**直觉示例**：
+
+```
+剪枝前：           剪枝后（v3、v5 权重低于 θ_w）：
+    root               root
+   ╱    ╲             ╱    ╲
+  v1     v2          v1     v2
+ ╱  ╲     ╲         ╱
+v3   v4    v5      v4
+(低) (高)  (低)    (高)
+```
+
+叶节点 $v_3$（低权重）和 $v_5$（低权重）被删除；$v_4$ 权重高，保留；$v_2$ 虽然子节点被删完、变为叶节点，但其自身 $w_{v_2}$ 若高于 $\theta_w$ 则保留，下轮再判断。
+
+剪枝后，若被删节点的父节点从多子变为单子（或无子），对其重新判断是否触发语义提升。
+
+### 3.5 记忆树 SSM 读取（Tree-SSM Readout）
+
+将记忆树按 BFS 序 $\pi = (v_1, v_2, \ldots, v_N)$ 展开，沿树进行状态空间模型的递推，得到每个节点的隐状态：
+
+**输入投影**：
+
+$$
+x_i = W_{\text{in}}\,[\mathbf{z}_i^v;\, \mathbf{a}_i;\, \mathbf{q}_i;\, \mathbf{s}_i;\, \log w_i] + b_{\text{in}}
+$$
+
+**节点自适应时间步**（重要性越高，时间步越大，信息保留越多）：
+
+$$
+\Delta_i = \text{softplus}\!\left(W_\Delta x_i + b_\Delta\right) \odot \sigma(W_w \log w_i + b_w)
+$$
+
+**离散化**（零阶保持）：
+
+$$
+\bar{A}_i = \exp(\Delta_i \cdot A), \qquad \bar{B}_i = (e^{\Delta_i A} - I) A^{-1} B(x_i)
+$$
+
+**树递推**（沿父子边传递隐状态）：
+
+$$
+\boxed{h_i = \bar{A}_i \odot h_{\text{par}(i)} + \bar{B}_i \odot x_i}, \qquad h_{\text{root}} = \mathbf{0}
+$$
+
+**输出**：
+
+$$
+y_i = C(x_i)\, h_i + D\, x_i
+$$
+
+**记忆 Token 提取**（取前 $K'$ 深度的节点输出，作为 $Z^M$）：
+
+$$
+Z^M = \left\{y_i \;:\; \text{depth}(v_i) \leq K'\right\} \in \mathbb{R}^{N_M \times d}
+$$
+
+> **关键特性**：$\Delta_i$ 的权重自适应使得重要节点（高 $w_i$）的记忆在树向上传播时衰减更慢，实现"重要记忆不遗忘"的效果。这是对标准 Mamba 的一个有意义的扩展。
+
+### 3.6 记忆树训练损失
+
+$$
+\mathcal{L}_{\text{tree}} = \mathcal{L}_{\text{recon}} + \lambda_1\,\mathcal{L}_{\text{sem}} + \lambda_2\,\mathcal{L}_{\text{prog}} + \lambda_3\,\mathcal{L}_{\text{depth}}
+$$
+
+**① 语义重建损失**（语义提升的信息保留性）：
+
+$$
+\mathcal{L}_{\text{recon}} = \sum_{v_p} \left\|\text{Dec}_{\text{sem}}(\mathbf{s}_p) - \frac{1}{|\text{ch}(v_p)|}\sum_{v_i \in \text{ch}(v_p)} \mathbf{s}_i\right\|_2^2
+$$
+
+**② 子任务对比损失**（不同子任务语义应可分）：
+
+$$
+\mathcal{L}_{\text{sem}} = -\frac{1}{|P|}\sum_{(i,j) \in P} \log \frac{\exp(\cos(\mathbf{s}_i, \mathbf{s}_j^+) / \tau_s)}{\sum_{k} \exp(\cos(\mathbf{s}_i, \mathbf{s}_k) / \tau_s)}
+$$
+
+其中 $(i, j^+)$ 为同一子任务阶段的正样本对，负样本从不同子任务采样。
+
+**③ 任务进度单调损失**（沿祖先-后代路径，进度应单调递增）：
+
+首先定义进度预测头：
+
+$$
+p_i = \sigma\!\left(\text{MLP}_{\text{prog}}(\mathbf{s}_i)\right) \in [0,1]
+$$
+
+$p_i$ 的含义是：从节点 $v_i$ 的语义嵌入出发，预测此刻任务已完成的比例（0=刚开始，1=已结束）。直觉上，任务越往后执行，对应的语义嵌入应编码越高的完成度。
+
+**排序约束仅施加在祖先-后代对（同一条根到叶路径上）**，不约束不同分支上的兄弟节点（它们不存在绝对时序）：
+
+$$
+\boxed{\mathcal{L}_{\text{prog}} = \frac{1}{|\mathcal{P}|}\sum_{(v_i,\, v_j)\,\in\,\mathcal{P}} \max\!\left(0,\; p_i - p_j + \epsilon\right)}
+$$
+
+$$
+\mathcal{P} = \left\{(v_i, v_j) \;\Big|\; v_i \in \mathcal{A}(v_j),\; v_j \in \mathcal{T}\right\}
+$$
+
+即 $\mathcal{P}$ 是树中所有满足"$v_i$ 是 $v_j$ 的祖先"的有序节点对。损失惩罚一切**祖先进度 $p_i$ 大于后代进度 $p_j$ 的违例情况**（允许 $\epsilon$ 的松弛间隔）。
+
+**直觉示例**（以"抓取→移动→放置"三节点主链为例）：
+
+```
+根(p≈0.0) → v_抓取(p≈0.3) → v_移动(p≈0.6) → v_放置(p≈0.9)
+```
+
+若 $p_{v\_抓取} > p_{v\_移动}$（违反单调性），则产生正的损失项；若正确单调则损失为零。不同分支上的节点（平行探索的子树）彼此间**不施加此约束**，因为它们不存在绝对时序先后。
+
+> **与原公式的本质区别**：原公式用 `depth(vi) < depth(vj)` 作为排序代理，在有分支的树中是错的——不同分支上深度3的节点和深度2的节点未必有时序先后关系，强行约束会引入矛盾的梯度。正确的做法是只约束结构上有传递关系的祖先-后代对。
+
+**④ 语义提升一致性损失**（新建的抽象节点应确实比其子节点更通用）：
+
+$$
+\boxed{\mathcal{L}_{\text{elev}} = \sum_{v_{\text{abs}}} \max\!\left(0,\; d_{\text{sem}}(\mathbf{s}_{\text{abs}},\, \bar{\mathbf{s}}_{\mathcal{G}}) - \gamma\right)}
+$$
+
+$$
+\bar{\mathbf{s}}_{\mathcal{G}} = \frac{\sum_{v_i \in \mathcal{G}} w_i\,\mathbf{s}_i}{\sum_{v_i \in \mathcal{G}} w_i}
+$$
+
+惩罚 $v_{\text{abs}}$ 的语义嵌入与其子节点均值偏离过大（超过间隔 $\gamma$），确保抽象节点是子节点语义的真实概括而非随机嵌入。
+
+更新总损失为：
+
+$$
+\mathcal{L}_{\text{tree}} = \mathcal{L}_{\text{recon}} + \lambda_1\,\mathcal{L}_{\text{sem}} + \lambda_2\,\mathcal{L}_{\text{prog}} + \lambda_3\,\mathcal{L}_{\text{elev}}
+$$
 
 ---
 
-## 8. Tree.json 数据结构规范
+## 四、核心创新二：语义引导 Mamba 最小生成树扫描（SGMTS）
 
-任务树以 JSON 格式存储，每个节点代表一个子任务，包含执行状态、视觉证据以及用于回溯的历史条件表征：
+### 4.1 理论动机
 
-```json
-{
-  "task_id": "prepare_breakfast_001",
-  "task_description": "Prepare breakfast with toast and coffee",
-  "root": {
-    "id": "root",
-    "type": "sequence",
-    "status": "in_progress",
-    "children": [
-      {
-        "id": "subtask_0",
-        "description": "pick up bread slice",
-        "type": "primitive",
-        "status": "completed",
-        "token_sequence": "<stored_fused_tokens_or_summary>",
-        "completion_evidence": {
-          "frame_idx": 142,
-          "confidence": 0.94
-        },
-        "failure_count": 0,
-        "backtrack_pointer": null
-      },
-      {
-        "id": "subtask_1",
-        "description": "place bread in toaster",
-        "type": "primitive",
-        "status": "in_progress",
-        "token_sequence": null,
-        "completion_evidence": null,
-        "failure_count": 1,
-        "backtrack_pointer": "subtask_0"
-      },
-      {
-        "id": "subtask_2",
-        "description": "make coffee",
-        "type": "sequence",
-        "status": "pending",
-        "children": [
-          {"id": "subtask_2_0", "description": "pour water", "status": "pending"},
-          {"id": "subtask_2_1", "description": "press brew button", "status": "pending"}
-        ]
-      }
-    ]
-  }
-}
+传统 ViT 将图像切分为均匀 patch，以全局自注意力建模全局依赖，计算复杂度为 $O(P^2)$，且对任务无关 background 区域与语义关键区域投入等量计算资源。VisionMamba 引入一维 S 形蛇形序列，将复杂度降为 $O(P)$，但蛇形扫描将空间邻近却方向不同的 patch 分离到序列两端，破坏了局部内容关联。
+
+**GrootVL（NeurIPS 2024 Spotlight，arXiv:2406.02395）** 提出以**最小生成树（MST）**组织 patch 扫描拓扑：在图像 patch 特征构成的 4-连通图上用余弦相似度定义边权，通过 Kruskal 算法提取 MST，再沿 BFS 遍历顺序执行树状 Mamba SSM 递推。视觉特征相近的 patch 在 MST 中相互靠近，SSM "父传子"递推使得**空间连续的语义区域**共享隐状态，兼顾了 $O(L)$ 线性复杂度与空间层次上下文建模。
+
+然而，GrootVL 的 MST 构建**纯粹依赖视觉特征**，与当前任务的语言指令完全无关——执行"抓取红色杯子"时，桌面背景与红色杯子在 MST 边权上无任何差异。本节提出 **SGMTS（Semantic-Guided Mamba Tree Scanning）**，在 GrootVL 树状 SSM 框架的基础上，在 MST 边权、BFS 根节点选取以及 SSM 时间步三处注入语言语义引导，其余结构与 GrootVL 保持完全兼容，可直接复用其 CUDA 核（`TreeScan`）。
+
+### 4.2 GrootVL 原理精确回顾（基于源码）
+
+本节基于 GrootVL 开源代码（`tree_scan_core.py` / `tree_scanning.py` / `grootv.py`）精确还原其三个核心步骤，为后续 SGMTS 改动提供清晰基线。
+
+#### 4.2.1 四连通图 + 余弦相似度边权 → MST
+
+给定视觉特征图 $F \in \mathbb{R}^{B \times C \times H \times W}$，构建**四连通邻接图**（仅水平与垂直相邻边，共 $(H{-}1)W + H(W{-}1)$ 条候选边）：
+
+```python
+# tree_scan_core.py: _build_feature_weight_cosine()
+weight_row = torch.cosine_similarity(fm[:,:,:-1,:], fm[:,:,1:,:], dim=1)  # 水平边
+weight_col = torch.cosine_similarity(fm[:,:,:,:-1], fm[:,:,:,1:], dim=1)  # 垂直边
+weight = torch.cat([weight_row, weight_col], dim=1)
+# 对 min-tree：取 -weight（余弦相似度越大，负值越小，MST 优先选择）
+weight = mapping_func(-weight)
 ```
 
-**状态迁移规则**（对应 BT-TL-DMPs 中的行为树节点状态）：
-- `pending` → `in_progress`：父节点激活，前序兄弟节点全部 `completed`
-- `in_progress` → `completed`：Tree LLM 检测到完成条件（置信度 > 阈值）
-- `in_progress` → `failed`：`failure_count` 超过最大重试次数（默认 3 次）
-- `failed` → `in_progress`：回溯指针激活，重置并重新执行
+对相邻 patch 对 $(i, j)$ 的 MST 目标等价于：
+
+$$
+\mathcal{T}^* = \arg\min_{\mathcal{T} \subseteq E} \sum_{(i,j) \in \mathcal{T}} (-\cos_{ij}), \qquad \cos_{ij} = \frac{\mathbf{f}_i^\top \mathbf{f}_j}{\|\mathbf{f}_i\|\|\mathbf{f}_j\|}
+$$
+
+即**余弦相似度最大的相邻 patch 对**会被 MST 优先收录，从而让视觉特征相近的 patch 在同一子树中。MST 通过 CUDA C++ 扩展 `_C.mst_forward`（Kruskal 算法）以近 $O(P)$ 复杂度实现。
+
+#### 4.2.2 BFS 遍历 → 扫描序
+
+对 MST $\mathcal{T}^*$ 执行广度优先搜索（`_C.bfs_forward`），生成：
+
+$$
+(\text{sorted\_index},\ \text{sorted\_parent},\ \text{sorted\_child})
+$$
+
+其中 `sorted_index[k]` 为 BFS 访问序第 $k$ 位的 patch 索引，`sorted_parent[k]` 为其父节点索引。此三元组完整编码树结构，后续 CUDA 核仅需遍历此线性序列即可完成 SSM 递推。
+
+#### 4.2.3 树状 SSM 递推（`tree_scan_refine_forward`）
+
+沿 BFS 序，对每个 patch $i$ 计算选择性状态空间递推（标准 Mamba，S4D 初始化）：
+
+$$
+\Delta_i = \mathrm{softplus}(W_\Delta r_i + b_\Delta), \qquad \bar{A}_i = e^{\Delta_i A}, \qquad \bar{B}_i = (e^{\Delta_i A} - I)A^{-1}B(x_i)
+$$
+
+$$
+h_i = \bar{A}_i \odot h_{\mathrm{par}(i)} + \bar{B}_i \odot x_i, \qquad y_i = C(x_i)\,h_i + D\,x_i
+$$
+
+隐状态 $h_{\mathrm{par}(i)}$ 来自**树中父节点**而非序列上一元素，是区别于常规 Mamba 的核心处。CUDA 实现采用**自底向上聚合 + 自顶向下广播**的两遍动态规划，整体复杂度 $O(P)$。
+
+`edge_coef`（边权系数）在精化传播 `tree_scan_refine_forward` 中控制父子信息的混合比例，提供对树结构信心的软调节。
+
+#### 4.2.4 GrootVLayer 整体架构
+
+```python
+# grootv.py: GrootVLayer.forward()
+x_in = in_proj(x)          # 投影成 x, z（门控）
+x, z  = x_in.chunk(2, -1)
+x     = act(conv2d(x))     # 深度卷积（局部上下文，d_conv > 1 时启用）
+y     = forward_core(x)    # Tree_SSM: tree_scanning()
+y     = y * act(z)         # 门控激活
+out   = out_proj(y)
+
+# 残差 + Layer Scale
+x = x + drop_path(γ₁ · TreeSSM(norm₁(x)))
+x = x + drop_path(γ₂ · MLP(norm₂(x)))
+```
+
+$\gamma_1, \gamma_2 \in \mathbb{R}^d$ 为逐通道可学习缩放因子（Layer Scale），抑制深层训练不稳定性。多个 `GrootVLayer` 堆叠构成 `GrootVBlock`，对应 ViT 中的 Transformer Block。
+
+### 4.3 SGMTS：在 GrootVL 基础上的四处语义引导改进
+
+SGMTS 在 GrootVL 三个核心步骤的**四处关键位置**注入语言语义，其余代码逻辑与 GrootVL 保持完全兼容。
+
+#### 4.3.1 语言指令语义评分（前置共享计算）
+
+将任务语言指令 $\ell$ 经文本编码器（冻结的 Qwen2.5 前若干层，隐状态均值池化）得到指令向量 $\mathbf{g} \in \mathbb{R}^{d_g}$，投影后与各 patch 特征计算语义相关度：
+
+$$
+\boxed{r_i^{\text{sem}} = \sigma\!\left(\frac{(W_g \mathbf{g})^\top \mathbf{f}_i}{\sqrt{d_f}}\right) \in [0,1], \quad i = 1,\ldots, P}
+$$
+
+$r_i^{\text{sem}}$ 越高，表示 patch $i$ 的视觉内容与当前任务指令越相关。该向量在下面四处复用。
+
+#### 4.3.2 改进①：语义调制 MST 边权
+
+将 GrootVL 的纯视觉余弦边权替换为：
+
+$$
+\boxed{w_{ij}^{\text{SGMTS}} = (1 - r_i^{\text{sem}})(1 - r_j^{\text{sem}}) \cdot (-\cos_{ij}) + \epsilon}
+$$
+
+**直觉**：若 $p_i, p_j$ 均与任务高度相关（$r_i, r_j \to 1$），则 $(1-r_i)(1-r_j) \to 0$，边权 $\approx \epsilon$（极小），Kruskal 算法优先纳入此边，使任务相关区域在 MST 中**直接相连**，形成连续子树；若两端均与任务无关，则退化为 GrootVL 原始的余弦距离权重，保持后向兼容。
+
+#### 4.3.3 改进②：语义引导根节点
+
+GrootVL 默认以固定顶点（如左上角）为 BFS 根，SGMTS 改为：
+
+$$
+\text{root} = \arg\max_{i} r_i^{\text{sem}}
+$$
+
+以**语义得分最高的 patch** 为 BFS 起点，任务焦点区域在 BFS 序中排列最前，SSM 递推时最先积累语义上下文，高层次任务状态从任务焦点向外传播。
+
+#### 4.3.4 改进③：语义注入 SSM 输入
+
+GrootVL 的 SSM 输入仅为视觉特征线性投影 $W_\text{in}\mathbf{f}_i$。SGMTS 以相关性加权的方式注入语言条件：
+
+$$
+x_i = W_{\text{in}} \mathbf{f}_i + r_i^{\text{sem}} \cdot W_g' \mathbf{g}
+$$
+
+语义相关性强的 patch 受语言引导影响更大；任务无关区域（$r_i \approx 0$）保持纯视觉驱动，避免语言噪声干扰低相关 patch 的特征。
+
+#### 4.3.5 改进④：语义自适应时间步
+
+$$
+\boxed{\Delta_i = \mathrm{softplus}(W_\Delta x_i) \cdot (1 + \beta \cdot r_i^{\text{sem}})}
+$$
+
+更大的 $\Delta_i$ 使状态矩阵 $\bar{A}_i = e^{\Delta_i A}$ 衰减更慢，子节点可更强地继承父节点隐状态。语义相关 patch 因此在 SSM 递推链中**信息保留更持久**，其特征向量可有效传播到更深层的子节点。$\beta \geq 0$ 为可学习标量参数（初始化为 0，训练中自适应）。
+
+### 4.4 计算复杂度分析
+
+| 步骤 | 操作 | 复杂度 |
+|---|---|---|
+| 语义评分 $r_i^{\text{sem}}$（改进①②③④共享） | 投影 + 内积 | $O(P \cdot d_f)$ |
+| 语义调制边权计算 | 逐元素乘 | $O(P)$ |
+| MST 构建（CUDA Kruskal） | `_C.mst_forward` | $O(P\,\alpha(P)) \approx O(P)$ |
+| BFS 排序 | `_C.bfs_forward` | $O(P)$ |
+| 树状 SSM 递推（上下两遍 DP） | `tree_scan_refine_forward` | $O(P)$ |
+| **SGMTS 端到端总复杂度** | — | $\mathbf{O(P \cdot d_f)}$ |
+
+相比 ViT 自注意力 $O(P^2 d)$，SGMTS 保持 GrootVL 的线性复杂度 $O(P)$，四处语义引导改进对渐近复杂度无额外量级开销（均为 $O(P)$ 或 $O(P d_f)$）。
+
+### 4.5 SGMTS 与相关方法精确对比
+
+| 特性 | ViT | VisionMamba | **GrootVL（源码）** | **SGMTS（本文）** |
+|---|---|---|---|---|
+| 扫描拓扑 | 无（全局 Attn） | 蛇形序列 | 4-连通 MST（余弦相似度） | 4-连通 MST（**语义调制**余弦相似度） |
+| 边权定义 | N/A | N/A | $-\cos_{ij}$（纯视觉） | $(1{-}r_i)(1{-}r_j)(-\cos_{ij})$（语义调制） |
+| BFS 根节点 | N/A | 固定左上 | **固定顶点**（源码默认） | $\arg\max_i r_i^{\text{sem}}$（任务焦点） |
+| SSM 输入 | N/A | $W_\text{in}x_i$ | $W_\text{in}\mathbf{f}_i$ | $W_\text{in}\mathbf{f}_i + r_i^{\text{sem}} W_g'\mathbf{g}$ |
+| 时间步 $\Delta_i$ | N/A | 输入依赖 | 输入依赖 | **任务语义**调制 |
+| 语言指令引导 | ✗ | ✗ | ✗ | ✅（边权 + 根 + 输入 + $\Delta$） |
+| 任务自适应 | ✗ | ✗ | ✗ | ✅ 每帧动态重建 |
+| 渐近复杂度 | $O(P^2 d)$ | $O(P)$ | $O(P)$ | $O(P \cdot d_f)$ |
 
 ---
 
-## 9. 总结
+## 五、核心创新三：多模态融合与动作生成
 
-MemoryTreeVLA 通过以下四个核心贡献构建了一个面向长时程机器人操控的完整框架：
+### 5.1 三流特征
 
-1. **层次化任务树记忆（Tree.json）**：借鉴 BT-TL-DMPs 的行为树模块化思想，将复杂任务分解为层次化子任务节点，每个节点存储执行状态、视觉证据及历史融合条件表征，支持精确的指针式回溯，解决了现有 VLA 模型无法有效处理长时程任务的问题。
+| 流 | 来源 | 维度 |
+|---|---|---|
+| $Z^V$ | SGMTS 视觉 Token | $\mathbb{R}^{P \times d}$ |
+| $Z^M$ | 记忆树 SSM 读取 Token | $\mathbb{R}^{N_M \times d}$ |
+| $\mathbf{e}^Q$ | 关节状态 MLP 编码 | $\mathbb{R}^{d}$ |
 
-2. **Multimodal Mamba 跨模态融合**：基于 GrootVL 的树状扫描 SSM，将视觉时序特征 $Z_v$、任务树特征 $Z_t$ 与机器人关节状态 token $Z_s$ 三路拼接后进行动态门控融合，以 $O(L)$ 线性复杂度实现比 Cross-Attention 更高效的跨模态依赖建模；$Z_s$ 的引入让融合上下文同时感知场景、任务进度和机器人构型，更贴近闭环控制需求。
+### 5.2 层次跨模态融合
 
-3. **单 Tree LLM + 直接动作头分工（Mamba 视觉编码）**：视觉特征完全由 Vision Mamba 提取，Tree LLM 采用 **Qwen2.5-1.5B-Instruct** 负责低频任务树初始化与更新；高频控制路径中不再引入 Action LLM，而是由 Multimodal Mamba 输出 token 序列直接条件化 Action Head，从而更贴近实时控制需求。
+**第一层：记忆引导视觉聚合**（用记忆 query 视觉 K/V，挑选与过往经历相关的视觉区域）
 
-4. **三阶段渐进训练**：受 Evo-1 两阶段训练范式启发，扩展为三阶段训练（Tree LLM / 树结构建模预训练 → 融合模块与动作头联合训练 → 端到端微调），在保留树管理能力与视觉语义表示的同时，逐步建立视觉-树-动作的联合分布。
+$$
+\tilde{Z}^{VM} = \text{MultiHeadCrossAttn}\!\!\left(\,Q=Z^M,\; K=Z^V,\; V=Z^V\,\right)
+$$
 
-**未来方向**：
-- 回溯触发条件的自动化设计（基于视觉-树特征分布偏移检测）
-- 引入 STL（Signal Temporal Logic，来自 BT-TL-DMPs）作为树节点的形式化约束，提升任务规范的精确性
-- 在 RoboCerebra 1,000 条长时程轨迹上进行完整实验验证
-- 探索在线树结构更新（任务执行过程中 Tree LLM 动态新增/删除子任务节点）
+**第二层：本体感知集成**
+
+$$
+\mathbf{e}^Q_{\text{exp}} = \mathbf{e}^Q \cdot \mathbf{1}_{N_M}^\top \in \mathbb{R}^{N_M \times d}
+$$
+
+$$
+Z^{\text{fused}} = \text{LayerNorm}\!\left(\tilde{Z}^{VM} + \text{MLP}\!\left([\tilde{Z}^{VM};\, \mathbf{e}^Q_{\text{exp}}]\right)\right) \in \mathbb{R}^{N_M \times d}
+$$
+
+### 5.3 LLM 条件化
+
+将 $Z^{\text{fused}}$ 线性投影后，拼接到 Qwen2.5 的语言 Token 前缀：
+
+$$
+X^{\text{LLM}} = \left[\text{Proj}_{\text{VL}}(Z^{\text{fused}});\; \text{TokenEmb}(\ell)\right] \in \mathbb{R}^{(N_M + L) \times d_{\text{LLM}}}
+$$
+
+LLM 自回归处理后输出最终隐状态 $H^{\text{LLM}} \in \mathbb{R}^{(N_M+L) \times d_{\text{LLM}}}$。
+
+### 5.4 动作生成头（Flow Matching Action Head）
+
+参考 Evo-1（CVPR 2026，arXiv:2511.04555）的 `FlowmatchingActionHead` 设计，结合本工程的融合特征 $Z^{\text{fused}}$ 和本体状态 $\mathbf{e}^Q$，采用**动作块预测 + 线性流匹配 ODE + 跨模态去噪 Transformer**架构，替代直接回归，以捕捉多模态动作分布。
+
+#### 5.4.1 为什么选 Flow Matching 而非直接回归
+
+直接 MSE 回归动作均值会对多模态动作分布（同一状态下多种合理操作策略）产生"模糊"预测，导致机器人在关键路径段动作犹豫。Flow Matching 将动作生成建模为从**标准噪声 → 专家动作**的连续 ODE 过程，学习速度场而非点估计，天然支持多峰分布。
+
+#### 5.4.2 动作块定义
+
+预测未来 $H_a$ 步的动作块（Action Chunk），而非单步动作，避免高频控制带来的短视行为：
+
+$$
+\mathbf{a}_{t:t+H_a} \in \mathbb{R}^{H_a \times d_a}, \qquad d_a = 7 \; (\text{Franka: 6D }\Delta\text{-pose} + \text{1D gripper})
+$$
+
+#### 5.4.3 条件上下文构建
+
+将融合特征与本体状态拼接，构成去噪 Transformer 的跨注意力键值：
+
+$$
+\mathbf{e}^Q_{\text{enc}} = \text{MLP}_{\text{state}}(\mathbf{e}^Q) \in \mathbb{R}^d
+$$
+
+$$
+C = \left[Z^{\text{fused}};\; \mathbf{e}^Q_{\text{enc}}\right] \in \mathbb{R}^{(N_M+1) \times d}
+$$
+
+$Z^{\text{fused}}$ 携带记忆树语义与视觉融合信息，$\mathbf{e}^Q_{\text{enc}}$ 提供当前实时本体感知，二者共同约束动作生成方向。
+
+#### 5.4.4 动作编码器（ActionTokenizer）
+
+参考 Evo-1 的 `MultiEmbodimentActionEncoder`，将含噪动作块编码为与上下文同维的 Token 序列：
+
+$$
+X_a = \text{ActionEnc}\!\left(\mathbf{a}^{\tau}_{t:t+H_a}\right) \in \mathbb{R}^{H_a \times d}
+$$
+
+具体地，对批内每一时间步 $k$：
+
+$$
+X_a^{(k)} = \text{ReLU}(W_3\,(\text{ReLU}(W_1\,\mathbf{a}^{\tau,(k)}) + \text{PE}(k) + \text{ReLU}(W_2\,(\ldots))))
+$$
+
+其中 PE$(k)$ 为正弦位置编码，用于区分动作块内不同时间步。
+
+#### 5.4.5 时间步嵌入
+
+将连续流时间 $\tau \in [0,1]$ 离散化为正弦嵌入，注入去噪 Transformer 每一层的前馈 sublayer：
+
+$$
+\mathbf{t}_{\text{emb}} = \text{PE}\!\left(\lfloor \tau \times 1000 \rfloor\right) \in \mathbb{R}^d
+$$
+
+#### 5.4.6 跨模态去噪 Transformer
+
+堆叠 $L$ 层 `BasicTransformerBlock`，每层以动作 Token 为 Query，以条件上下文 $C$ 为 Key/Value，时间嵌入注入前馈层：
+
+$$
+X_a^{(0)} = \text{ActionEnc}(\mathbf{a}^\tau_{t:t+H_a})
+$$
+
+$$
+X_a^{(l)} = X_a^{(l-1)} + \text{CrossAttn}\!\left(\text{LN}(X_a^{(l-1)}),\; C,\; C\right)
+$$
+
+$$
+X_a^{(l)} \leftarrow X_a^{(l)} + \text{FFN}\!\left(\text{LN}(X_a^{(l)}) + \mathbf{t}_{\text{emb}}\right), \quad l = 1, \ldots, L
+$$
+
+最终对动作 Token 序列做扁平化池化后通过 MLP 输出预测速度场：
+
+$$
+\hat{\mathbf{v}} = \text{MLP}_{\text{head}}\!\left(W_{\text{pool}}\,\text{flatten}(X_a^{(L)})\right) \in \mathbb{R}^{H_a \times d_a}
+$$
+
+#### 5.4.7 训练：线性插值 ODE + 速度回归损失
+
+**时间采样**：参考 Evo-1，采用 Beta(2, 2) 分布采样流时间 $\tau$，该分布在 $[0,1]$ 中部密集，避免过度拟合噪声端($\tau \to 0$)和数据端($\tau \to 1$)的极端退化情形：
+
+$$
+\tau \sim \text{Beta}(2,\,2),\quad \tau \in [0.02, 0.98]
+$$
+
+**线性插值构造含噪动作**（直线 ODE 路径，噪声到真实动作的恒定速度场）：
+
+$$
+\boldsymbol{\varepsilon} \sim \text{Uniform}[-1, 1]^{H_a \times d_a}, \qquad \mathbf{a}^\tau = (1-\tau)\,\boldsymbol{\varepsilon} + \tau\,\mathbf{a}^*_{t:t+H_a}
+$$
+
+**训练目标**：回归恒定速度场 $\mathbf{v}^* = \mathbf{a}^* - \boldsymbol{\varepsilon}$（LLM 速度回归而非 score matching）：
+
+$$
+\boxed{L_{\text{flow}} = \mathbb{E}_{\tau,\,\boldsymbol{\varepsilon},\,\mathbf{a}^*}\!\left[\left\|\hat{\mathbf{v}}_\theta\!\left(\mathbf{a}^\tau,\, C,\, \tau\right) - (\mathbf{a}^* - \boldsymbol{\varepsilon})\right\|_2^2\right]}
+$$
+
+#### 5.4.8 推理：Euler ODE 积分
+
+从均匀噪声出发，以 $N$ 步 Euler 积分沿速度场推进到动作端点（$\tau: 0 \to 1$）：
+
+$$
+\mathbf{a}^{(0)} \sim \text{Uniform}[-1,1]^{H_a \times d_a}
+$$
+
+$$
+\mathbf{a}^{(i+1)} = \mathbf{a}^{(i)} + \frac{1}{N} \cdot \hat{\mathbf{v}}_\theta\!\left(\mathbf{a}^{(i)},\, C,\, \frac{i}{N}\right), \quad i = 0, 1, \ldots, N{-}1
+$$
+
+最终 $\mathbf{a}^{(N)} = \mathbf{a}_{t:t+H_a}$ 即为输出动作块，机器人执行前 $k$（$k < H_a$）步后以新观测重新预测（时序聚合策略）。
+
+#### 5.4.9 与 Evo-1 原版的差异对比
+
+| 设计维度 | Evo-1 原版 | **本工程适配** |
+|---|---|---|
+| 条件来源 | InternVL3 图像 Token + 语言 Token | **记忆树融合特征 $Z^{\text{fused}}$**（含历史语义） |
+| 状态注入 | `CategorySpecificMLP(state)` | `MLP_state(e^Q)` — 本体感知嵌入 |
+| 多实体支持 | `CategorySpecificLinear`（多 embodiment 独立权重） | 单实体（Franka），预留扩展接口 |
+| 动作维度 | 可配置（MetaWorld 24D） | $d_a = 7$（6D $\Delta$-pose + gripper） |
+| 时间采样 | Beta(2,2) ∩ [0.02, 0.98] | **保留**（同 Evo-1） |
+| ODE 步数 | $N = 20$ | $N = 20$（可调） |
+| 上下文长度 | 固定帧数 | $N_M$（由记忆树节点数动态决定） |
+
+---
+
+## 六、完整训练策略
+
+### 6.1 数据集分析与对应关系
+
+本工程使用两个互补的数据集驱动三阶段训练，各数据集的结构特点与模型组件形成直接对应：
+
+#### RoboCerebra（NeurIPS 2025，arXiv:2506.06677）
+
+- **数据规模**：大规模长程仿真数据集，家庭操作环境，延伸任务时域（extended task horizon）
+- **标注特点**：GPT 生成任务指令 → 自动分解为 $K$ 个子任务序列 → 人工遥操作执行各子任务 → 形成**层次化、密集标注**的轨迹数据
+- **与本工程的对应**：
+  - 子任务边界标签 → **分支创建（B）** 的监督信号（子任务切换时 $d_t \geq \theta_{\text{fuse}}$）
+  - 子任务序列顺序 → **进度单调损失 $\mathcal{L}_{\text{prog}}$** 的正样本对
+  - 任务 → 子任务层次结构 → **语义提升（②）** 的目标树拓扑（验证 $v_{\text{abs}}$ 是否与 GPT 分解一致）
+  - System 2 规划/记忆评估维度 → 直接测试 HMT 的记忆积累质量
+
+#### LIBERO（NeurIPS 2023，arXiv:2306.03310）
+
+- **数据规模**：130 个任务，四个子集，每任务 50 条人工遥操作演示
+- **四个子集及用途**：
+
+| 子集 | 任务数 | 核心挑战 | 本工程用途 |
+|---|---|---|---|
+| LIBERO-SPATIAL | 10 | 空间关系泛化 | SGMTS 语义引导验证 |
+| LIBERO-OBJECT | 10 | 物体类别迁移 | 记忆树跨物体检索 |
+| LIBERO-GOAL | 10 | 目标多样性 | 语言条件动作头 |
+| **LIBERO-LONG** | 10 | **长程 8+ 步操作** | **主训练集（动作策略）** |
+
+- **与本工程的对应**：高质量遥操作演示驱动 Flow Matching 动作头训练；LIBERO-LONG 为长程记忆能力提供行为克隆监督
+
+---
+
+### 6.2 两阶段训练范式（仿 Evo-1）
+
+借鉴 Evo-1 的两阶段训练范式：**先训集成模块与动作头，再全局微调**。结合本工程的记忆树特性，扩展为三个阶段：
+
+#### Phase 1：SGMTS 视觉语义预训练（基于 LIBERO 观测）
+
+```
+目标:   训练 SGMTS 从图像 patch 中提取任务相关语义特征
+数据:   LIBERO 全集（观测帧 + 任务语言指令对），约 360K 帧
+损失:   L_align = InfoNCE(Z^V_avg, g)          # 视觉 Token 均值与指令嵌入对齐
+        L_mst   = ||w_ij^SGMTS - w_ij^target|| # MST 一致性（语义高相关 patch 连通性）
+冻结:   LLM 骨干、动作头、记忆树模块
+训练:   SGMTS 的 W_g（语义投影）、GrootVLayer 参数
+```
+
+**目的**：让 SGMTS 在接触完整轨迹前，先学会将语言指令 $\mathbf{g}$ 映射为正确的视觉语义权重 $r_i^{\text{sem}}$，避免 Phase 2 中视觉特征尚未收敛影响记忆树结构学习。
+
+#### Phase 2：记忆树结构预训练（基于 RoboCerebra 标注）
+
+```
+目标:   用 RoboCerebra 层次化标注监督 HMT 的树拓扑形成过程
+数据:   RoboCerebra 完整轨迹，含子任务边界标签 {b_k}、子任务语义标签 {l_k}
+损失:   L_tree = L_recon + λ1·L_sem + λ2·L_prog + λ3·L_elev
+冻结:   LLM（完全冻结）、SGMTS（冻结 GrootVLayer，仅允许语义投影微调）
+训练:   记忆树的全部参数（节点嵌入、MLP_elev、θ_fuse 等）
+```
+
+**RoboCerebra 标注 → 损失监督的具体对应**：
+
+| RoboCerebra 标注 | 对应损失项 | 监督方式 |
+|---|---|---|
+| 子任务边界时刻 $b_k$ | $\mathcal{L}_{\text{prog}}$ | 边界前后节点构成祖先-后代正样本对 |
+| 子任务语义标签 $l_k$ | $\mathcal{L}_{\text{sem}}$ | 同子任务节点语义嵌入相似度 $> \gamma_+$ |
+| 任务 → 子任务层次 | $\mathcal{L}_{\text{elev}}$ | $v_{\text{abs}}$ 的 $\mathbf{s}_{\text{abs}}$ 对齐 GPT 生成的子任务组合描述 |
+| 完整轨迹重建 | $\mathcal{L}_{\text{recon}}$ | 从树 SSM 读取结果解码还原历史动作序列 |
+
+#### Phase 3a：动作头初始化训练（基于 LIBERO-LONG，仅训练动作相关模块）
+
+仿照 Evo-1 Stage 1，**冻结主干特征提取，仅训练集成映射层与动作头**，快速建立动作策略的初始能力：
+
+```
+目标:   训练 Proj_VL（融合投影）和 FlowmatchingActionHead
+数据:   LIBERO-LONG（10 任务 × 50 demos，每任务约 8 步长程操作）
+损失:   L_act = L_flow（Flow Matching 速度回归）
+冻结:   LLM、SGMTS、记忆树模块
+训练:   Proj_VL、ActionHead（L=8 层 Transformer + MLP_head）
+超参:   lr=1e-5, batch_size=16, max_steps=5,000, warmup=1,000, H_a=16
+```
+
+#### Phase 3b：端到端全局微调（基于 LIBERO 全集）
+
+仿照 Evo-1 Stage 2，解冻 LLM（LoRA 微调）并以更大数据量进行全局训练：
+
+```
+目标:   端到端优化全模型，提升跨任务泛化与长程操作成功率
+数据:   LIBERO 全集（LIBERO-LONG 主），可混入 RoboCerebra 短轨迹片段
+损失:   L_total = L_flow + λ_tree·L_tree + λ_vis·L_SGMTS
+冻结:   无（LLM 采用 LoRA r=16，其他模块全参数）
+训练:   全模型
+超参:   lr=1e-5, batch_size=16, max_steps=80,000, warmup=1,000, H_a=16
+```
+
+---
+
+### 6.3 总体损失函数
+
+$$
+\mathcal{L}_{\text{total}} = \underbrace{\mathcal{L}_{\text{flow}}}_{\text{Flow Matching 动作损失}} + \lambda_{\text{tree}} \underbrace{\mathcal{L}_{\text{tree}}}_{\text{记忆树结构损失}} + \lambda_{\text{vis}} \underbrace{\mathcal{L}_{\text{SGMTS}}}_{\text{视觉语义对齐}}
+$$
+
+| 损失项 | 计算方式 | 权重 | 主要数据来源 |
+|---|---|---|---|
+| $\mathcal{L}_{\text{flow}}$ | Flow Matching 速度场 MSE（见 5.4.7 节） | 1.0 | LIBERO |
+| $\mathcal{L}_{\text{recon}}$ | 树 SSM 输出解码历史动作的重建误差 | $\lambda_1=0.5$ | RoboCerebra |
+| $\mathcal{L}_{\text{sem}}$ | 同子任务节点语义内聚 + 跨子任务语义分离 | $\lambda_2=0.3$ | RoboCerebra 标签 |
+| $\mathcal{L}_{\text{prog}}$ | 祖先-后代对进度单调性（见 3.6 节） | $\lambda_3=0.2$ | RoboCerebra 子任务序 |
+| $\mathcal{L}_{\text{elev}}$ | $v_{\text{abs}}$ 语义嵌入与子任务组描述对齐 | $\lambda_4=0.1$ | RoboCerebra 层次标注 |
+| $\mathcal{L}_{\text{SGMTS}}$ | 视觉 Token 与指令嵌入对比对齐 | $\lambda_5=0.1$ | LIBERO 观测 |
+
+---
+
+### 6.4 记忆树操作触发时机
+
+| 操作 | 触发条件 | 频率 |
+|---|---|---|
+| 融合更新（A） | $d_t < \theta_{\text{fuse}}$，每步 | $t=1,2,\ldots$ |
+| 分支创建（B） | $d_t \geq \theta_{\text{fuse}}$，每步 | 按需（子任务边界处密集） |
+| 记忆强化（①） | Phase 3 每步反向传播后，依据 $\|\nabla_{\Phi_C}L_{\text{task}}\|$ | 每训练步 |
+| 语义提升（②） | $|\text{ch}(v_p)| \geq K_{\text{elev}}$（RoboCerebra 中对应子任务数 $\leq 6$） | 按需 |
+| 剪枝（③） | 树节点数 $> N_{\text{max}}$ 或 episode 结束 | 每 $K=50$ 步 |
+
+## 十、符号表速查
+
+| 符号 | 含义 |
+|---|---|
+| $\mathcal{T}_t$ | 时刻 $t$ 的记忆树 |
+| $v_i$ | 记忆树节点 $i$ |
+| $v_{\text{act}}$ | 当前活跃节点 |
+| $\mathbf{z}_i^v$ | 节点 $i$ 的视觉嵌入在线均值 |
+| $\mathbf{z}_i^{v,\text{init}}$ | 节点 $i$ 初建时的视觉嵌入（固定） |
+| $\mathbf{A}_i$ | 节点 $i$ 融合的动作时序列表 |
+| $\mathbf{q}_i^{\text{init}}$ | 节点 $i$ 初建时的关节状态（固定，用于回溯） |
+| $\mathbf{s}_i$ | 节点 $i$ 的语义嵌入在线均值 |
+| $n_i$ | 节点 $i$ 融合的时间步计数 |
+| $w_i$ | 节点 $i$ 的记忆权重 |
+| $h_i$ | 节点 $i$ 的 SSM 隐状态 |
+| $\Delta_i$ | 节点 $i$ 的自适应时间步 |
+| $\theta_{\text{fuse}}$ | 融合/分支的唯一判断阈值 |
+| $K_{\text{elev}}$ | 触发语义提升的子节点数阈值 |
+| $\delta_w$ | 融合更新权重增量 |
+| $p_i$ | 节点 $i$ 预测任务进度 |
+| $\mathcal{P}$ | 树中所有祖先-后代有序对集合（用于进度损失） |
+| $\mathcal{A}(v_i)$ | 节点 $v_i$ 的祖先集合 |
+| $\mathcal{G}$ | 语义提升时选出的子节点分组 |
+| $v_{\text{abs}}$ | 语义提升新建的抽象父节点 |
+| $Z^V$ | SGMTS 输出视觉 Token |
+| $Z^M$ | 记忆树 SSM 输出 Token |
+| $\mathbf{e}^Q$ | 关节状态嵌入 |
+| $Z^{\text{fused}}$ | 融合后 Token |
+| $\mathbf{g}$ | 任务文本嵌入 |
+| $r_i^{\text{sem}}$ | Patch $i$ 的语义相关性得分 |
+| $p_i$ | 节点 $i$ 预测任务进度 |
+| $\ell$ | 任务语言描述 |
+| $a_t$ | 时刻 $t$ 输出动作 |
+| $\mathcal{T}_k$ | 子树 $k$ |
+| $\mathcal{A}(v_t)$ | 节点 $v_t$ 的祖先集合 |
+

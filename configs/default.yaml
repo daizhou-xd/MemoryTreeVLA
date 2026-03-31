@@ -1,0 +1,70 @@
+# MemoryTreeVLA — Default configuration
+# ─────────────────────────────────────────────────────────────────
+# Single GPU:  python train.py --config configs/default.yaml --phase 1
+# 8-GPU DS:    bash scripts/train_8gpu.sh 1
+# ─────────────────────────────────────────────────────────────────
+
+# ── DeepSpeed ─────────────────────────────────────────────────────
+deepspeed:
+  enabled: false                    # override with --deepspeed flag
+  config:  "configs/ds_zero2.json"  # phase 1-3; use ds_zero3.json for phase 4
+
+# ── Data ──────────────────────────────────────────────────────────
+data:
+  root:        "dataset/RoboCerebra/RoboCerebra_trainset"
+  scenes:      null      # null = all scenes
+  img_h:       224
+  img_w:       224
+  subsample:   4         # temporal subsampling (1 = every frame)
+  max_seqlen:  256       # truncate long trajectories
+
+# ── Model ─────────────────────────────────────────────────────────
+model:
+  llm_path:    "checkpoints/Qwen2.5-1.5B-Instruct"
+  d:           256       # unified embedding dim
+  d_a:         7         # action dim (Franka: 6D Δ-pose + gripper)
+  d_q:         84        # proprioceptive state dim
+  d_visual:    256       # SGMTS output dim
+  d_ssm:       256       # TreeSSM output dim
+  d_state:     16        # SSM hidden-state dim per channel
+  patch_size:  16        # pixels per image patch
+  H_a:         16        # action prediction horizon
+  n_ode:       20        # ODE integration steps (inference)
+  # Memory tree
+  theta_fuse:  0.4       # semantic distance merge threshold
+  K_elev:      4         # children count elevation trigger
+  delta_w:     0.1       # importance weight increment per merge
+  tau:         0.1       # soft-gate temperature
+
+# ── Training ──────────────────────────────────────────────────────
+train:
+  batch_size:    4       # per-GPU micro-batch size
+  num_workers:   4
+  epochs:        50
+  lr:            1.0e-4
+  weight_decay:  1.0e-4
+  ckpt_dir:      "checkpoints/runs"
+  save_every:    5
+
+# ── Loss weights ──────────────────────────────────────────────────
+loss:
+  w_flow:   1.0
+  w_recon:  0.5
+  w_sem:    0.5
+  w_prog:   0.3
+  w_elev:   0.2
+
+# ── Logging ───────────────────────────────────────────────────────
+log_every:   10          # print every N batches
+# ── Weights & Biases ────────────────────────────────────────────
+# Enable at runtime: --wandb  (no need to change this file)
+wandb:
+  project: "MemoryTreeVLA"
+  entity:  null            # set to your W&B team name
+  # name and tags are auto-generated from phase + timestamp; override with
+  # --wandb_name <run-name>  --wandb_tags phase1 a6000  on the command line
+# ── Notes ─────────────────────────────────────────────────────────
+# Phase 1 warm-up:       epochs=20,  lr=1e-4,  DS config: ds_zero2.json
+# Phase 2 structure:     epochs=15,  lr=5e-5,  DS config: ds_zero2.json
+# Phase 3 action head:   epochs=30,  lr=1e-4,  DS config: ds_zero2.json
+# Phase 4 joint ft:      epochs=10,  lr=1e-5,  DS config: ds_zero3.json
