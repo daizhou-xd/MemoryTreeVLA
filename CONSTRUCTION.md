@@ -296,7 +296,21 @@ v3   v4    v5      v4
 
 ### 3.5 记忆树 SSM 读取（Tree-SSM Readout）
 
-将记忆树按 BFS 序 $\pi = (v_1, v_2, \ldots, v_N)$ 展开，沿树进行状态空间模型的递推，得到每个节点的隐状态：
+#### 设计动机：只扫描上层高语义节点
+
+记忆树中，**上层节点**（深度 $\leq K'$，尤其是语义提升操作②创建的抽象节点）经过多次 Welford 融合与跨子任务聚合，其语义嵌入 $\mathbf{s}_i$ 是稳定、抽象的子任务摘要；**底层叶节点**是当前 episode 最新插入的临时观测，尚未经过语义沉淀，引入 SSM 只会引入序列噪声。
+
+因此，Tree-SSM Readout 采用**扫描前预过滤（Pre-filter）**策略：
+
+$$
+\boxed{\mathcal{V}_{\text{upper}} = \left\{\,v_i \in \mathcal{T} \;\Big|\; \text{depth}(v_i) \leq K'\,\right\}}
+$$
+
+SSM 递推仅在 $\mathcal{V}_{\text{upper}}$ 上进行，叶节点及深层临时节点**完全不参与计算**。由于 BFS 序保证父节点早于子节点出现，且 $\text{depth}(\text{par}(v)) = \text{depth}(v) - 1$，若 $v \in \mathcal{V}_{\text{upper}}$ 则其父节点必然也在 $\mathcal{V}_{\text{upper}}$ 中，因此预过滤后父子隐状态传递关系完全一致，不会断链。
+
+---
+
+取 $\mathcal{V}_{\text{upper}}$ 的 BFS 序 $\pi = (v_1, v_2, \ldots, v_{N_M})$（$N_M = |\mathcal{V}_{\text{upper}}|$），仅在此子集上执行 SSM：
 
 **输入投影**：
 
@@ -316,25 +330,27 @@ $$
 \bar{A}_i = \exp(\Delta_i \cdot A), \qquad \bar{B}_i = (e^{\Delta_i A} - I) A^{-1} B(x_i)
 $$
 
-**树递推**（沿父子边传递隐状态）：
+**树递推**（沿父子边传递隐状态，仅在 $\mathcal{V}_{\text{upper}}$ 内传递）：
 
 $$
 \boxed{h_i = \bar{A}_i \odot h_{\text{par}(i)} + \bar{B}_i \odot x_i}, \qquad h_{\text{root}} = \mathbf{0}
 $$
 
-**输出**：
+**输出与记忆 Token**（$\mathcal{V}_{\text{upper}}$ 全部节点输出即为 $Z^M$，无需再次过滤）：
 
 $$
-y_i = C(x_i)\, h_i + D\, x_i
+y_i = C(x_i)\, h_i + D\, x_i, \qquad Z^M = \left\{y_i \;:\; v_i \in \mathcal{V}_{\text{upper}}\right\} \in \mathbb{R}^{N_M \times d}
 $$
 
-**记忆 Token 提取**（取前 $K'$ 深度的节点输出，作为 $Z^M$）：
+| 对比维度 | 原设计（后过滤） | **新设计（预过滤）** |
+|---|---|---|
+| SSM 计算范围 | 所有 $N$ 个节点 | 仅 $N_M \leq N$ 个上层节点 |
+| 叶节点隐状态 | 计算但丢弃 | **不计算** |
+| 父子链完整性 | 完整 | **完整**（depth 性质保证） |
+| 计算效率 | $O(N)$ | $O(N_M)$，$N_M \ll N$ 时显著提速 |
+| 语义纯净度 | 上层+噪声叶混合 | **仅稳定抽象语义** |
 
-$$
-Z^M = \left\{y_i \;:\; \text{depth}(v_i) \leq K'\right\} \in \mathbb{R}^{N_M \times d}
-$$
-
-> **关键特性**：$\Delta_i$ 的权重自适应使得重要节点（高 $w_i$）的记忆在树向上传播时衰减更慢，实现"重要记忆不遗忘"的效果。这是对标准 Mamba 的一个有意义的扩展。
+> **关键特性**：$\Delta_i$ 的权重自适应使得重要节点（高 $w_i$）的记忆在树向上传播时衰减更慢，实现"重要记忆不遗忘"的效果。结合预过滤，$Z^M$ 完全由经过语义沉淀的抽象节点构成，为后续 LLM 条件化提供干净的长程历史表示。
 
 ### 3.6 记忆树训练损失
 

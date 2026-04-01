@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 import time
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -50,7 +51,7 @@ except ImportError:
 
 from models import MemoryTreeVLA
 from models.memory_tree.operations import reinforce, prune
-from losses import tree_loss, l_recon, l_prog
+from losses import tree_loss, l_prog
 from dataset import RoboCerebraDataset, robocerebra_collate
 
 
@@ -87,7 +88,7 @@ def set_trainable(model: MemoryTreeVLA, phase: int) -> List[torch.nn.Parameter]:
     """
     Freeze all params then unfreeze the modules active at this phase.
     Phase 1: SGMTS + s_proj + tree_ssm + recon_decoder
-    Phase 2: + fusion
+    Phase 2: + fusion + prog_head
     Phase 3: + action_head
     Phase 4: + llm
     """
@@ -98,7 +99,7 @@ def set_trainable(model: MemoryTreeVLA, phase: int) -> List[torch.nn.Parameter]:
     if phase <= 2:
         train_modules.append(model.recon_decoder)
     if phase >= 2:
-        train_modules.append(model.fusion)
+        train_modules.extend([model.fusion, model.prog_head])
     if phase >= 3:
         train_modules.append(model.action_head)
     if phase >= 4:
@@ -149,40 +150,28 @@ def train_epoch(
             plain_optimizer.zero_grad()
 
         # ── Forward ─────────────────────────────────────────────────
-        loss_dict = model(
-            images=frames,
-            instructions=instructions,
-            states=states,
-            actions=actions,
-            subtask_ids=subtask_ids,
-        )
-        L_flow     = loss_dict.get("L_flow", torch.tensor(0.0, device=device))
-        L_prog_val = loss_dict.get("L_prog", torch.tensor(0.0, device=device))
+        with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+            loss_dict = model(
+                images=frames,
+                instructions=instructions,
+                states=states,
+                actions=actions,
+                subtask_ids=subtask_ids,
+                compute_flow=(phase >= 3),
+            )
+            L_flow     = loss_dict.get("L_flow",  torch.tensor(0.0, device=device))
+            L_recon_val = loss_dict.get("L_recon", torch.tensor(0.0, device=device))
+            L_prog_val  = loss_dict.get("L_prog",  torch.tensor(0.0, device=device))
 
-        # ── Phase-specific auxiliary loss ────────────────────────────
-        L_recon_val = torch.tensor(0.0, device=device)
-        if phase in (1, 2):
-            for b in range(B):
-                tree_b = model.get_tree(b)
-                if tree_b.size() == 0:
-                    continue
-                z_v_stack = torch.stack(
-                    [tree_b.nodes[nid].z_v.to(device) for nid in tree_b.bfs_order()], dim=0
-                )
-                L_recon_val = L_recon_val + l_recon(
-                    model.recon_decoder, z_v_stack, z_v_stack.detach()
-                )
-            L_recon_val = L_recon_val / B
-
-        # ── Combined loss ────────────────────────────────────────────
-        loss = tree_loss(
-            L_flow   = L_flow      if phase >= 3 else torch.tensor(0.0, device=device),
-            L_recon  = L_recon_val if phase <= 2 else None,
-            L_prog   = L_prog_val  if phase >= 2 else None,
-            w_flow   = cfg["loss"]["w_flow"],
-            w_recon  = cfg["loss"]["w_recon"],
-            w_prog   = cfg["loss"]["w_prog"],
-        )
+            # ── Combined loss ────────────────────────────────────────────
+            loss = tree_loss(
+                L_flow   = L_flow       if phase >= 3 else torch.tensor(0.0, device=device, dtype=torch.bfloat16),
+                L_recon  = L_recon_val  if phase <= 2 else None,
+                L_prog   = L_prog_val   if phase >= 2 else None,
+                w_flow   = cfg["loss"]["w_flow"],
+                w_recon  = cfg["loss"]["w_recon"],
+                w_prog   = cfg["loss"]["w_prog"],
+            )
 
         # ── Backward + optimiser step ────────────────────────────────
         if use_deepspeed:

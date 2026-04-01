@@ -16,7 +16,7 @@ data:
   img_h:       224
   img_w:       224
   subsample:   4         # temporal subsampling (1 = every frame)
-  max_seqlen:  256       # truncate long trajectories
+  max_seqlen:  16         # truncate long trajectories (OOM guard: was 256)
 
 # ── Model ─────────────────────────────────────────────────────────
 model:
@@ -38,7 +38,7 @@ model:
 
 # ── Training ──────────────────────────────────────────────────────
 train:
-  batch_size:    4       # per-GPU micro-batch size
+  batch_size:    1       # per-GPU micro-batch size (OOM guard: was 4)
   num_workers:   4
   epochs:        50
   lr:            1.0e-4

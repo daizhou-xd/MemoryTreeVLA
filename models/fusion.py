@@ -1,21 +1,22 @@
 """
-CrossModalFusion — CONSTRUCTION.md Section 5.3.
+CrossModalFusion — CONSTRUCTION.md Sections 5.2 & 5.4.3.
 
-Fuses the three information streams:
-  - Z_M : memory tree readout     (N_M, d_ssm)
-  - Z_V : SGMTS visual tokens     (P, d_visual)
-  - g   : language CLS embedding  (d_lang,)
-  - q   : proprioceptive state    (d_q,)
+Architecture (two-layer hierarchy):
 
-Output: Z_fused ∈ R^{N_ctx × d}  (context tokens for the action head)
+Layer 1 — Memory-guided visual aggregation (Section 5.2, first layer):
+    Z̃_VM = MultiHeadCrossAttn(Q=Z^M, K=Z^V, V=Z^V)  ∈ R^{N_M × d}
+    Memory tokens query visual tokens; only task-relevant visual context
+    is pulled into the memory representation.
 
-Architecture:
-  1. Project all streams to d (shared dim)
-  2. Concatenate [Z_M_proj ; Z_V_proj] → Z_all  (N_M+P, d)
-  3. Two rounds of cross-attention:
-       Q=Z_all, K=V=Z_all  (self-attn to mix streams)
-  4. Append proprioceptive token (projected q) as extra head token
-  5. LayerNorm → output Z_fused
+Layer 2 — Proprioceptive integration (Section 5.2, second layer):
+    e^Q_exp = e^Q · 1_{N_M}^T  ∈ R^{N_M × d}
+    Z_fused = LayerNorm(Z̃_VM + MLP([Z̃_VM ; e^Q_exp]))  ∈ R^{N_M × d}
+
+Context for action head (Section 5.4.3):
+    e^Q_enc = MLP_state(e^Q)  ∈ R^d
+    C = [Z_fused ; e^Q_enc]  ∈ R^{(N_M + 1) × d}
+
+Output shape: (B, N_M + 1, d).
 """
 import torch
 import torch.nn as nn
@@ -23,44 +24,61 @@ import torch.nn as nn
 from models.attn import FlashMHA
 
 
-# ================================================================
-#  Pre-norm Fusion Block (self-attention + FFN)
-# ================================================================
+# ==============================================================
+#  Cross-attention block  (Q ≠ K/V sources)
+# ==============================================================
 
-class FusionBlock(nn.Module):
-    """Pre-norm Transformer block using FlashMHA for best GPU utilisation."""
+class CrossAttentionBlock(nn.Module):
+    """
+    Pre-norm cross-attention block.
+    Q comes from `z_q`, K/V come from `z_kv`.
+    Both are expected to be in the same embedding space (dim d).
+    """
 
     def __init__(self, d: int, n_heads: int, dropout: float = 0.0):
         super().__init__()
-        self.norm1 = nn.LayerNorm(d)
-        self.attn  = FlashMHA(d, n_heads, dropout=dropout)
-        self.norm2 = nn.LayerNorm(d)
-        self.ff    = nn.Sequential(
+        self.norm_q  = nn.LayerNorm(d)
+        self.norm_kv = nn.LayerNorm(d)
+        self.attn    = FlashMHA(d, n_heads, dropout=dropout)
+        self.norm_ff = nn.LayerNorm(d)
+        self.ff      = nn.Sequential(
             nn.Linear(d, d * 4),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(d * 4, d),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.norm1(x)
-        x = x + self.attn(h, h, h)
-        h = self.norm2(x)
-        x = x + self.ff(h)
-        return x
+    def forward(
+        self,
+        z_q:  torch.Tensor,   # (B, N_q,  d)
+        z_kv: torch.Tensor,   # (B, N_kv, d)
+    ) -> torch.Tensor:
+        # Cross-attention: Q=z_q, K=V=z_kv  (residual on z_q)
+        q  = self.norm_q(z_q)
+        kv = self.norm_kv(z_kv)
+        z_q = z_q + self.attn(q, kv, kv)
+        # Feed-forward
+        z_q = z_q + self.ff(self.norm_ff(z_q))
+        return z_q
 
+
+# ==============================================================
+#  CrossModalFusion
+# ==============================================================
 
 class CrossModalFusion(nn.Module):
     """
-    Args:
-        d_ssm    : memory SSM output dim
-        d_visual : SGMTS output dim
-        d_lang   : LLM embedding dim
-        d_q      : proprioceptive state dim
-        d        : unified fusion dim (= output dim)
-        n_heads  : number of attention heads
-        n_layers : depth of self-attention stacks
-        dropout  : dropout probability
+    Parameters
+    ----------
+    d_ssm    : memory SSM output dim
+    d_visual : SGMTS output dim
+    d_lang   : LLM embedding dim  (accepted but not separately projected —
+               language context is absorbed by Z^M via tree dynamics)
+    d_q      : proprioceptive state dim
+    d        : unified fusion dim (= output dim)
+    n_heads  : number of attention heads
+    n_layers : depth of cross-attention stack (Layer 1)
+    dropout  : dropout probability
     """
 
     def __init__(
@@ -78,37 +96,69 @@ class CrossModalFusion(nn.Module):
         self.d = d
 
         # ── Input projections ────────────────────────────────────────
-        self.mem_proj   = nn.Linear(d_ssm,   d)
-        self.vis_proj   = nn.Linear(d_visual, d)
-        self.lang_proj  = nn.Linear(d_lang,  d)   # language CLS → 1 token
-        self.prop_proj  = nn.Linear(d_q,     d)   # proprioception → 1 token
+        self.mem_proj = nn.Linear(d_ssm,    d)
+        self.vis_proj = nn.Linear(d_visual, d)
 
-        # ── Self-attention blocks (Flash Attention) ───────────────────
-        self.blocks = nn.ModuleList([
-            FusionBlock(d, n_heads, dropout) for _ in range(n_layers)
+        # ── Layer 1: memory-guided visual aggregation ─────────────────
+        # Q = Z^M (memory tokens), K/V = Z^V (visual tokens)
+        self.cross_blocks = nn.ModuleList([
+            CrossAttentionBlock(d, n_heads, dropout) for _ in range(n_layers)
         ])
 
+        # ── Layer 2: proprioceptive integration (Section 5.2) ─────────
+        # MLP([Z̃_VM ; e^Q_exp]) → residual on Z̃_VM, then LayerNorm
+        self.prop_proj = nn.Linear(d_q, d)            # e^Q → d
+        self.prop_mlp  = nn.Sequential(               # MLP([Z̃_VM ; e^Q_exp])
+            nn.Linear(d * 2, d * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d * 4, d),
+        )
         self.out_norm = nn.LayerNorm(d)
+
+        # ── Action-head context token (Section 5.4.3) ─────────────────
+        # e^Q_enc = MLP_state(e^Q)  appended as extra token to Z_fused
+        self.state_mlp = nn.Sequential(
+            nn.Linear(d_q, d),
+            nn.GELU(),
+            nn.Linear(d, d),
+        )
 
     def forward(
         self,
-        Z_M: torch.Tensor,      # (B, N_M, d_ssm)
-        Z_V: torch.Tensor,      # (B, P,   d_visual)
-        lang_g: torch.Tensor,   # (B, d_lang)
-        q: torch.Tensor,        # (B, d_q)
+        Z_M:    torch.Tensor,   # (B, N_M, d_ssm)
+        Z_V:    torch.Tensor,   # (B, P,   d_visual)
+        lang_g: torch.Tensor,   # (B, d_lang)  — kept for API compat
+        q:      torch.Tensor,   # (B, d_q)
     ) -> torch.Tensor:
-        """Returns Z_fused : (B, N_M + P + 2, d)"""
-        B = Z_M.shape[0]
+        """
+        Returns C : (B, N_M + 1, d) — context for the action head.
 
-        z_m  = self.mem_proj(Z_M)               # (B, N_M, d)
-        z_v  = self.vis_proj(Z_V)               # (B, P,   d)
-        z_l  = self.lang_proj(lang_g).unsqueeze(1)  # (B, 1, d)
-        z_p  = self.prop_proj(q).unsqueeze(1)       # (B, 1, d)
+        Section 5.2:
+            Layer 1  : Z̃_VM = CrossAttn(Q=Z^M, K=V=Z^V)
+            Layer 2  : Z_fused = LN(Z̃_VM + MLP([Z̃_VM ; e^Q_exp]))
+        Section 5.4.3:
+            C = [Z_fused ; e^Q_enc]
+        """
+        # Project to shared dim d
+        z_m = self.mem_proj(Z_M)   # (B, N_M, d)
+        z_v = self.vis_proj(Z_V)   # (B, P,   d)
 
-        # Concatenate all tokens
-        Z = torch.cat([z_l, z_m, z_v, z_p], dim=1)   # (B, 2+N_M+P, d)
+        # ── Layer 1: cross-attention  Q=Z^M, K/V=Z^V ─────────────────
+        Z_tilde = z_m
+        for blk in self.cross_blocks:
+            Z_tilde = blk(Z_tilde, z_v)   # (B, N_M, d)
 
-        for blk in self.blocks:
-            Z = blk(Z)
-        Z = self.out_norm(Z)
-        return Z   # (B, N_ctx, d)
+        # ── Layer 2: proprioceptive integration ───────────────────────
+        e_q = self.prop_proj(q)                                      # (B, d)
+        e_q_exp = e_q.unsqueeze(1).expand(-1, Z_tilde.shape[1], -1) # (B, N_M, d)
+        Z_fused = self.out_norm(
+            Z_tilde + self.prop_mlp(torch.cat([Z_tilde, e_q_exp], dim=-1))
+        )                                                            # (B, N_M, d)
+
+        # ── Append proprioceptive token (Section 5.4.3) ───────────────
+        e_q_enc = self.state_mlp(q).unsqueeze(1)                     # (B, 1, d)
+        C = torch.cat([Z_fused, e_q_enc], dim=1)                     # (B, N_M+1, d)
+
+        return C
+

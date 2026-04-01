@@ -32,6 +32,8 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as grad_ckpt
 from transformers import AutoModel, AutoTokenizer
 
 from .memory_tree import (
@@ -103,15 +105,23 @@ class MemoryTreeVLA(nn.Module):
         )
         _attn_impl   = "flash_attention_2" if _can_flash else "eager"
         _torch_dtype = torch.bfloat16       if _can_flash else torch.float32
+        # Load directly onto the current CUDA device so Flash Attention 2 does
+        # not warn about CPU initialisation.
+        _device_map  = {"": torch.cuda.current_device()} if torch.cuda.is_available() else None
         try:
             self.llm = AutoModel.from_pretrained(
                 llm_path,
                 trust_remote_code=True,
                 attn_implementation=_attn_impl,
                 torch_dtype=_torch_dtype,
+                device_map=_device_map,
             )
         except Exception:
-            self.llm = AutoModel.from_pretrained(llm_path, trust_remote_code=True)
+            self.llm = AutoModel.from_pretrained(
+                llm_path,
+                trust_remote_code=True,
+                device_map=_device_map,
+            )
         d_lang = self.llm.config.hidden_size
 
         if freeze_llm:
@@ -165,7 +175,18 @@ class MemoryTreeVLA(nn.Module):
         )
 
         # ── Auxiliary reconstruction decoder (phases 1-2) ───────────────
+        # CONSTRUCTION Section 3.6①: Dec_sem(s_p) ≈ mean(s_children)
+        # Input: d (semantic embedding), output: d (same semantic space)
         self.recon_decoder = NodeReconDecoder(d=d)
+        self.d_visual = d_visual
+
+        # ── Progress prediction head (phase 2+) ─────────────────────────
+        # CONSTRUCTION Section 3.6③: p_i = σ(MLP_prog(s_i)) ∈ [0,1]
+        self.prog_head = nn.Sequential(
+            nn.Linear(d, d // 2),
+            nn.GELU(),
+            nn.Linear(d // 2, 1),
+        )
 
         # ── One tree per batch sample (managed externally per episode) ─
         self._tree_pool: Dict[int, HierarchicalMemoryTree] = {}
@@ -226,7 +247,12 @@ class MemoryTreeVLA(nn.Module):
         a_node = a_node.squeeze(0)
 
         # ── Update memory tree ───────────────────────────────────────
-        tree.insert(z_v_node, a_node, q.squeeze(0), s)
+        q_norm = q.squeeze(0)
+        if q_norm.shape[0] < self.d_q:
+            q_norm = F.pad(q_norm, (0, self.d_q - q_norm.shape[0]))
+        elif q_norm.shape[0] > self.d_q:
+            q_norm = q_norm[:self.d_q]
+        tree.insert(z_v_node, a_node, q_norm, s)
 
         # Elevation check
         if tree.elevation_pending_parent is not None:
@@ -255,6 +281,7 @@ class MemoryTreeVLA(nn.Module):
         states: torch.Tensor,          # (B, T, d_q)
         actions: torch.Tensor,         # (B, T, d_a)
         subtask_ids: Optional[torch.Tensor] = None,  # (B, T) int subtask index
+        compute_flow: bool = True,
     ) -> Dict[str, torch.Tensor]:
         """
         Full trajectory forward.  Returns dict of scalar losses:
@@ -275,14 +302,23 @@ class MemoryTreeVLA(nn.Module):
 
         # ── Trajectory loop ──────────────────────────────────────────
         all_Z_fused, all_mu = [], []
-
         for t in range(T):
             imgs_t  = images[:, t]                # (B, C, H, W)
             q_t     = states[:, t]                # (B, d_q)
             a_t     = actions[:, t]               # (B, d_a)
 
-            # Visual features
-            Z_V_t   = self.sgmts(imgs_t, lang_g) # (B, P, d_visual)
+            # Visual features — gradient checkpointing saves activation memory
+            # by recomputing during backward instead of storing T copies
+            if self.training:
+                Z_V_t = grad_ckpt(self.sgmts, imgs_t, lang_g, use_reentrant=False)
+            else:
+                Z_V_t = self.sgmts(imgs_t, lang_g)  # (B, P, d_visual)
+
+            # Normalize q to self.d_q (pad or truncate) to handle variable state dims
+            if q_t.shape[1] < self.d_q:
+                q_t = F.pad(q_t, (0, self.d_q - q_t.shape[1]))
+            elif q_t.shape[1] > self.d_q:
+                q_t = q_t[:, :self.d_q]
 
             # Per-sample tree update
             Z_M_list, mu_list = [], []
@@ -292,13 +328,13 @@ class MemoryTreeVLA(nn.Module):
                 z_v_b   = s_b
 
                 tree_b  = self.get_tree(b)
-                mu_t_b, _ = tree_b.insert(z_v_b, a_t[b], q_t[b], s_b)
+                mu_t_b, new_active_id = tree_b.insert(z_v_b, a_t[b], q_t[b], s_b)
                 mu_list.append(mu_t_b)
 
                 # Trigger elevation if pending
-                if hasattr(tree_b, '_elevation_pending') and tree_b._elevation_pending is not None:
-                    semantic_elevation(tree_b, tree_b._elevation_pending, self.mlp_elev, device)
-                    tree_b._elevation_pending = None
+                if tree_b.elevation_pending_parent is not None:
+                    semantic_elevation(tree_b, tree_b.elevation_pending_parent, self.mlp_elev, device)
+                    tree_b.elevation_pending_parent = None
 
                 Z_M_b = self.tree_ssm(tree_b, device=device)  # (N_M, d_ssm)
                 Z_M_list.append(Z_M_b)
@@ -312,18 +348,32 @@ class MemoryTreeVLA(nn.Module):
 
             # Fusion
             Z_fused_t = self.fusion(Z_M_pad, Z_V_t, lang_g, q_t)   # (B, N_ctx, d)
+            # Detach when flow loss won't be used to free computation graph
+            if not compute_flow:
+                Z_fused_t = Z_fused_t.detach()
             all_Z_fused.append(Z_fused_t)
             all_mu.append(sum(mu_list) / B)
 
-        # ── Action loss over sliding H_a windows ─────────────────────
-        L_flow = self._compute_flow_loss(all_Z_fused, actions, device)
+            # Periodic cache flush to prevent memory fragmentation
+            if t % 16 == 0:
+                torch.cuda.empty_cache()
 
-        # ── Progression loss (anchor-based, at final timestep) ───────
+        # ── Action loss over sliding H_a windows ─────────────────────────────
+        if compute_flow:
+            L_flow = self._compute_flow_loss(all_Z_fused, actions, device)
+        else:
+            L_flow = torch.tensor(0.0, device=device)
+
+        # ── Auxiliary losses (after full trajectory) ─────────────────
+        # L_recon: semantic parent→children reconstruction (Section 3.6①)
+        L_recon = self._compute_recon_loss(B, device)
+        # L_prog: monotone progress ordering (Section 3.6③)
         L_prog = self._compute_prog_loss(B, device)
 
         losses = {
-            "L_flow": L_flow,
-            "L_prog": L_prog,
+            "L_flow":  L_flow,
+            "L_recon": L_recon,
+            "L_prog":  L_prog,
         }
         return losses
 
@@ -350,12 +400,51 @@ class MemoryTreeVLA(nn.Module):
             losses_t.append(self.action_head.flow_loss(a_gt, Z_fused_t))
         return torch.stack(losses_t).mean()
 
-    def _compute_prog_loss(self, B: int, device: torch.device) -> torch.Tensor:
+    def _compute_recon_loss(self, B: int, device: torch.device) -> torch.Tensor:
         """
-        Progression loss: ancestor node embedding should have lower
-        norm than descendant when projected to a ranking head.
-        Uses cosine distance between ancestor-descendant pairs.
-        Approximated here as a margin loss.
+        CONSTRUCTION.md Section 3.6① — Semantic reconstruction loss.
+
+        For every node v_p that has children:
+            L_recon += ||Dec_sem(s_p) - (1/|ch|) Σ_{v_i ∈ ch(v_p)} s_i||²
+
+        Dec_sem = self.recon_decoder (MLP, d → d).
+        Targets are the mean of children's semantic embeddings (in-tree s_i).
+        """
+        total_loss = torch.tensor(0.0, device=device)
+        count = 0
+        for b in range(B):
+            tree = self.get_tree(b)
+            for nid, node in tree.nodes.items():
+                children = node.children_ids       # list of child node IDs
+                if not children:
+                    continue
+                # Mean of children's semantic embeddings
+                s_children = torch.stack(
+                    [tree.nodes[c].s.to(device) for c in children], dim=0
+                )                                        # (K, d)
+                s_mean = s_children.mean(0)              # (d,)
+                # Decode parent semantic
+                s_p = node.s.to(device)                  # (d,)
+                s_hat = self.recon_decoder(s_p.unsqueeze(0)).squeeze(0)  # (d,)
+                total_loss = total_loss + F.mse_loss(s_hat, s_mean.detach())
+                count += 1
+        if count == 0:
+            return total_loss
+        return total_loss / count
+
+    def _compute_prog_loss(self, B: int, device: torch.device, epsilon: float = 0.1) -> torch.Tensor:
+        """
+        CONSTRUCTION.md Section 3.6③ — Task progression ordering loss.
+
+        For each ancestor–descendant pair (v_i, v_j):
+            p_i = σ(MLP_prog(s_i)) ∈ [0,1]   (predicted completion ratio)
+            p_j = σ(MLP_prog(s_j)) ∈ [0,1]
+
+        Hinge loss penalises violations of monotonicity along root→leaf paths:
+            L_prog = (1/|P|) Σ max(0, p_i - p_j + ε)
+
+        ε is a margin; ancestor should have LOWER progress (p_i < p_j).
+        Only ancestor–descendant pairs on the same root-to-leaf chain are used.
         """
         total_loss = torch.tensor(0.0, device=device)
         count = 0
@@ -369,12 +458,11 @@ class MemoryTreeVLA(nn.Module):
                 desc_node = tree.nodes[desc_id]
                 s_anc  = anc_node.s.to(device)
                 s_desc = desc_node.s.to(device)
-                # Hinge: cosine(anc, desc) should be > other pairs
-                # Simple proxy: parent s should align with child s (they are on the same branch)
-                cos_sim = torch.nn.functional.cosine_similarity(
-                    s_anc.unsqueeze(0), s_desc.unsqueeze(0)
-                )
-                total_loss = total_loss + (1.0 - cos_sim)
+                # p_i = σ(MLP_prog(s_i)) per CONSTRUCTION Section 3.6③
+                p_anc  = torch.sigmoid(self.prog_head(s_anc.unsqueeze(0))).squeeze()
+                p_desc = torch.sigmoid(self.prog_head(s_desc.unsqueeze(0))).squeeze()
+                # Hinge: ancestor progress must be strictly less than descendant's
+                total_loss = total_loss + F.relu(p_anc - p_desc + epsilon)
                 count += 1
         if count == 0:
             return total_loss

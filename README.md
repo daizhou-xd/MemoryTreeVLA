@@ -93,22 +93,14 @@ MemoryTreeVLA/
 以 **Ubuntu 22.04 / 20.04** 为例（CentOS/Rocky 类似）：
 
 ```bash
-# 更新包列表
-sudo apt-get update && sudo apt-get upgrade -y
+# 若有 sudo 权限，安装系统级编译依赖（可选，有 sudo 才能执行）
+# sudo apt-get update && sudo apt-get install -y build-essential libaio-dev libopenmpi-dev openmpi-bin
 
-# 编译依赖（flash-attn 需要）
-sudo apt-get install -y \
-    build-essential \
-    git \
-    wget \
-    curl \
-    ninja-build \
-    cmake \
-    libaio-dev \
-    libopenmpi-dev \
-    openmpi-bin \
-    python3-dev \
-    python3-pip
+# 无 sudo 权限时，用 conda 安装等价依赖（推荐）
+conda install -c conda-forge ninja cmake compilers openmpi -y
+
+# ninja / cmake 也可以用 pip 安装（已写入 requirements.txt）
+pip install ninja cmake
 
 # CUDA Toolkit（若服务器未预装，安装对应驱动版本的 CUDA）
 # 查看当前驱动版本

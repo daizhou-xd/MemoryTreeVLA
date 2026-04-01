@@ -18,7 +18,12 @@ from .tree import HierarchicalMemoryTree
 class TreeSSMReadout(nn.Module):
     """
     Input  : HierarchicalMemoryTree  (any size)
-    Output : Z_M ∈ R^{N × d_ssm}   (BFS-ordered node features)
+    Output : Z_M ∈ R^{N_M × d_ssm}  (upper-layer nodes only, BFS order)
+
+    Pre-filter (CONSTRUCTION.md Section 3.5):
+        Only nodes with depth <= max_depth are scanned.  Leaf nodes and deep
+        transient nodes are excluded entirely — not computed, not output.
+        Parent-chain integrity is guaranteed because depth(par(v)) < depth(v).
 
     Node input vector:
         x_i = W_in [z_v_i ; a_last_i ; q_i ; s_i ; log(w_i)] + b_in
@@ -91,10 +96,17 @@ class TreeSSMReadout(nn.Module):
         device: Optional[torch.device] = None,
     ) -> torch.Tensor:
         """
-        Returns Z_M of shape (N, d_ssm), where N = tree.size().
-        If max_depth is set, only returns nodes within that depth.
+        Returns Z_M of shape (N_M, d_ssm), where N_M = |V_upper|.
+
+        Pre-filter: only nodes with depth <= max_depth enter the SSM.
+        If max_depth is None, all nodes are scanned (original behaviour).
         """
-        bfs_ids = tree.bfs_order()
+        # ── Pre-filter: restrict to upper-layer nodes ─────────────────
+        if self.max_depth is not None:
+            bfs_ids = tree.bfs_order_up_to_depth(self.max_depth)
+        else:
+            bfs_ids = tree.bfs_order()
+
         if not bfs_ids:
             d = next(self.parameters()).device if device is None else device
             return torch.zeros(1, self.d_ssm, device=d)
@@ -102,14 +114,15 @@ class TreeSSMReadout(nn.Module):
         device = next(self.parameters()).device
 
         # ── Build input tensor X ─────────────────────────────────────
+        weight_dtype = self.in_proj.weight.dtype
         rows = []
         for nid in bfs_ids:
             node = tree.nodes[nid]
-            z_v   = node.z_v.to(device).float()
-            a     = node.a_last.to(device).float()
-            q     = node.q.to(device).float()
-            s     = node.s.to(device).float()
-            log_w = torch.log(torch.tensor([node.w + 1e-6], device=device))
+            z_v   = node.z_v.to(device=device, dtype=weight_dtype)
+            a     = node.a_last.to(device=device, dtype=weight_dtype)
+            q     = node.q.to(device=device, dtype=weight_dtype)
+            s     = node.s.to(device=device, dtype=weight_dtype)
+            log_w = torch.log(torch.tensor([node.w + 1e-6], device=device, dtype=weight_dtype))
             rows.append(torch.cat([z_v, a, q, s, log_w], dim=0))
 
         X     = torch.stack(rows, dim=0)          # (N, d_in)
@@ -121,7 +134,7 @@ class TreeSSMReadout(nn.Module):
         # delta: (N, d_ssm)
 
         # ── SSM (A negative real for stability, S4D) ─────────────────
-        A = -torch.exp(self.A_log.float())        # (d_ssm, d_state)
+        A = -torch.exp(self.A_log.to(dtype=weight_dtype))  # (d_ssm, d_state)
         B = self.B_proj(X_p)                      # (N, d_state)
         C = self.C_proj(X_p)                      # (N, d_state)
 
@@ -149,10 +162,4 @@ class TreeSSMReadout(nn.Module):
 
         Y = self.out_norm(Y)
 
-        # ── Optional depth filtering ──────────────────────────────────
-        if self.max_depth is not None:
-            mask = [tree.depth(nid) <= self.max_depth for nid in bfs_ids]
-            mask_t = torch.tensor(mask, dtype=torch.bool, device=device)
-            Y = Y[mask_t]
-
-        return Y   # (N_kept, d_ssm)
+        return Y   # (N_M, d_ssm)  — upper-layer nodes only

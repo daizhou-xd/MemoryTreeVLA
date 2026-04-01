@@ -191,7 +191,8 @@ class FlowMatchingActionHead(nn.Module):
         if device is None:
             device = ctx.device
 
-        a_t = torch.randn(B, self.H_a, self.d_a, device=device)
+        # a^(0) ~ Uniform[-1, 1]  (CONSTRUCTION Section 5.4.8)
+        a_t = torch.empty(B, self.H_a, self.d_a, device=device).uniform_(-1.0, 1.0)
         dt  = 1.0 / self.N_ode
 
         for step in range(self.N_ode):
@@ -212,15 +213,26 @@ class FlowMatchingActionHead(nn.Module):
         ctx: torch.Tensor,       # (B, N_ctx, d_ctx)
     ) -> torch.Tensor:
         """
-        Conditional flow matching loss.
-        Sample t ~ U[0,1], interpolate a_t = (1-t)*a_0 + t*a_gt,
-        regress velocity (a_gt - a_0).
+        Conditional flow matching loss — CONSTRUCTION.md Section 5.4.7.
+
+        Time sampling  : τ ~ Beta(2, 2) clipped to [0.02, 0.98]
+        Noise          : ε ~ Uniform[-1, 1]^{H_a × d_a}
+        Interpolation  : a_τ = (1 - τ)·ε + τ·a*
+        Velocity target: v* = a* - ε
+        Loss           : E[‖v_θ(a_τ, τ, C) - v*‖²]
         """
         B = a_gt.shape[0]
         device = a_gt.device
 
-        t        = torch.rand(B, device=device)
-        a_noise  = torch.randn_like(a_gt)
+        # τ ~ Beta(2, 2) ∩ [0.02, 0.98]
+        beta_dist = torch.distributions.Beta(
+            torch.tensor(2.0, device=device),
+            torch.tensor(2.0, device=device),
+        )
+        t = beta_dist.sample((B,)).clamp(0.02, 0.98)   # (B,)
+
+        # ε ~ Uniform[-1, 1]
+        a_noise  = torch.empty_like(a_gt).uniform_(-1.0, 1.0)
         t_expand = t.view(B, 1, 1)
 
         a_t  = (1.0 - t_expand) * a_noise + t_expand * a_gt

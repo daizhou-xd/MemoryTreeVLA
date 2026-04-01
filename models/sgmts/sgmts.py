@@ -6,11 +6,12 @@ Pipeline for a single frame (H×W RGB image):
   1. Patch CNN → patch features F ∈ R^{P × d_f}
   2. Language semantic scoring: r_i = σ(W_g g · f_i / √d_f)
   3. Build MST over a 4/8-connected patch grid using semantic edge weights:
-        w_ij = (1 − r_i)(1 − r_j) exp(−cos_ij) + ε
+        w_ij = (1 − r_i)(1 − r_j)(−cos_ij) + ε            (CONSTRUCTION 4.3.2)
   4. Root = argmax r_i^sem
   5. BFS from root → ordered sequence
-  6. Tree-SSM with semantic-adaptive Δ:
-        Δ_i = softplus(W_Δ x_i) · (1 + β r_i)
+  6. Tree-SSM with semantic-adaptive input and Δ:
+        x_i = W_in·f_i + r_i^sem · W_g'·g                 (CONSTRUCTION 4.3.4)
+        Δ_i = softplus(W_Δ x_i) · (1 + β r_i)             (CONSTRUCTION 4.3.5)
   7. Output: Z^V ∈ R^{P × d_visual}
 
 All MST computation uses CPU union-find; no CUDA extension required.
@@ -135,15 +136,18 @@ class SGMTSEncoder(nn.Module):
         connectivity: int = 4,
     ):
         super().__init__()
-        self.d_f   = d_f
-        self.beta  = beta
+        self.d_f      = d_f
+        self.d_state  = d_state
+        self.beta     = beta
         self.connectivity = connectivity
 
         # Patch extractor
         self.patch_cnn = PatchCNN(patch_size=patch_size, d_f=d_f)
 
-        # Language gate
-        self.W_gate = nn.Linear(d_lang, d_f, bias=False)
+        # Language gate (for semantic scoring r_sem)
+        self.W_gate   = nn.Linear(d_lang, d_f, bias=False)
+        # Separate projection for SSM input conditioning (Section 4.3.4)
+        self.W_g_prime = nn.Linear(d_lang, d_f, bias=False)
 
         # SSM parameters
         A_init = torch.arange(1, d_state + 1, dtype=torch.float).unsqueeze(0).expand(d_f, -1)
@@ -195,7 +199,7 @@ class SGMTSEncoder(nn.Module):
         for b in range(B):
             f_b  = feats[b]          # (P, d_f)
             r_b  = r_sem[b]          # (P,)
-            Y_b  = self._scan_one(f_b, r_b, nH, nW, device)   # (P, d_visual)
+            Y_b  = self._scan_one(f_b, r_b, nH, nW, device, lang_g[b])   # (P, d_visual)
             all_Y.append(Y_b)
 
         return torch.stack(all_Y, dim=0)   # (B, P, d_visual)
@@ -206,10 +210,11 @@ class SGMTSEncoder(nn.Module):
 
     def _scan_one(
         self,
-        f: torch.Tensor,   # (P, d_f)
-        r: torch.Tensor,   # (P,)   semantic scores
+        f: torch.Tensor,        # (P, d_f)
+        r: torch.Tensor,        # (P,)   semantic scores
         nH: int, nW: int,
         device: torch.device,
+        lang_g_b: torch.Tensor, # (d_lang,)  language gate vector for this sample
     ) -> torch.Tensor:
         P = nH * nW
 
@@ -238,7 +243,8 @@ class SGMTSEncoder(nn.Module):
         cos_ij = (f_norm[edge_src] * f_norm[edge_dst]).sum(dim=1)
         r_u    = r_cpu[edge_src]
         r_v    = r_cpu[edge_dst]
-        w_ij   = (1 - r_u) * (1 - r_v) * torch.exp(-cos_ij) + 1e-6
+        # CONSTRUCTION Section 4.3.2: w_ij = (1-r_i)(1-r_j) * (-cos_ij) + ε
+        w_ij   = (1 - r_u) * (1 - r_v) * (-cos_ij) + 1e-6
 
         # Kruskal MST
         mst_idx = _kruskal_mst(edge_src, edge_dst, w_ij, P)
@@ -270,8 +276,11 @@ class SGMTSEncoder(nn.Module):
         A = -torch.exp(self.A_log.float()).to(device)   # (d_f, d_state)
 
         bfs_t     = torch.tensor(bfs_order, dtype=torch.long, device=device)
-        X         = f[bfs_t]                            # (P, d_f)
         r_sorted  = r[bfs_t]                            # (P,)
+
+        # CONSTRUCTION Section 4.3.4: x_i = W_in·f_i + r_i^sem · W_g'·g
+        g_prime = self.W_g_prime(lang_g_b.to(device))   # (d_f,)
+        X = f[bfs_t] + r_sorted.unsqueeze(1) * g_prime.unsqueeze(0)  # (P, d_f)
 
         delta     = F.softplus(self.W_delta(X))         # (P, d_f)
         delta     = delta * (1.0 + self.beta * r_sorted.unsqueeze(1))  # semantic boost

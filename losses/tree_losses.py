@@ -29,18 +29,26 @@ import torch.nn.functional as F
 # ==================================================================
 
 class NodeReconDecoder(nn.Module):
-    """Simple MLP decoder: z_v (d,) → d_patch (mean patch reconstruction)."""
+    """
+    Semantic reconstruction decoder: s_p (d,) → ŝ_children_mean (d,).
 
-    def __init__(self, d: int, d_patch: int = 256 * 3):
+    CONSTRUCTION.md Section 3.6①:
+        L_recon = Σ_{v_p has children} ||Dec_sem(s_p) - (1/|ch|) Σ s_i||²
+    """
+
+    def __init__(self, d: int, d_patch: int = None):
+        """d_patch is accepted but ignored (kept for backwards compatibility)."""
         super().__init__()
         self.mlp = nn.Sequential(
             nn.Linear(d, d * 2),
             nn.GELU(),
-            nn.Linear(d * 2, d_patch),
+            nn.Linear(d * 2, d),
         )
 
     def forward(self, z_v: torch.Tensor) -> torch.Tensor:
-        return self.mlp(z_v)
+        # Cast input to match model weight dtype (e.g. bfloat16 under DeepSpeed)
+        weight_dtype = next(self.parameters()).dtype
+        return self.mlp(z_v.to(dtype=weight_dtype))
 
 
 def l_recon(

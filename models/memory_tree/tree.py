@@ -77,6 +77,27 @@ class HierarchicalMemoryTree:
             queue.extend(self._nodes[nid].children_ids)
         return result
 
+    def bfs_order_up_to_depth(self, max_depth: int) -> List[int]:
+        """
+        Return node ids in BFS order, restricted to depth <= max_depth.
+
+        Because depth(parent) = depth(child) - 1, any included node's parent
+        is guaranteed to also be included, so hidden-state parent lookups in
+        tree_ssm.py remain consistent without extra linking logic.
+        """
+        if self.root_id is None:
+            return []
+        result: List[int] = []
+        queue = [(self.root_id, 0)]
+        while queue:
+            nid, d = queue.pop(0)
+            if d > max_depth:
+                continue
+            result.append(nid)
+            for cid in self._nodes[nid].children_ids:
+                queue.append((cid, d + 1))
+        return result
+
     def ancestor_descendant_pairs(self) -> List[Tuple[int, int]]:
         """All (v_i, v_j) where v_i is a strict ancestor of v_j — for L_prog."""
         pairs: List[Tuple[int, int]] = []
