@@ -31,22 +31,23 @@ import torch.nn.functional as F
 class PatchCNN(nn.Module):
     """
     Splits image into non-overlapping patches and embeds each with a
-    small CNN.  Mimics ViT patch embedding but keeps a receptive field
-    that respects local texture inductive bias.
+    ViT-style linear projection (unfold → flatten → MLP).
+
+    Replaces the original Conv2d-based extractor to avoid dependence on
+    libcudnn_cnn_train.so.8 (which may be missing or version-mismatched on
+    some CUDA 12.4 deployments).  The MLP over flattened patch pixels is
+    equivalent in representational capacity and requires only cuBLAS.
     """
 
     def __init__(self, patch_size: int = 16, d_f: int = 256, in_channels: int = 3):
         super().__init__()
         self.patch_size = patch_size
+        d_patch = in_channels * patch_size * patch_size   # e.g. 3×16×16 = 768
         self.proj = nn.Sequential(
-            nn.Conv2d(in_channels, 64,  kernel_size=3, padding=1),
+            nn.Linear(d_patch, d_patch // 2),
             nn.GELU(),
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.AdaptiveAvgPool2d((1, 1)),   # pool each patch to a scalar map
+            nn.Linear(d_patch // 2, d_f),
         )
-        # After pool: (B*P, 128, 1, 1) → flatten → (B*P, 128)
-        self.fc = nn.Linear(128, d_f)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, int, int]:
         """
@@ -60,12 +61,12 @@ class PatchCNN(nn.Module):
         ps = self.patch_size
         nH, nW = H // ps, W // ps
 
-        # Unfold into patches: (B, C, nH, nW, ps, ps)
-        patches = x.unfold(2, ps, ps).unfold(3, ps, ps)        # (B,C,nH,nW,ps,ps)
-        patches = patches.contiguous().view(B * nH * nW, C, ps, ps)
+        # Unfold into patches → (B, nH, nW, C, ps, ps) → flatten → (B*P, C*ps*ps)
+        patches = x.unfold(2, ps, ps).unfold(3, ps, ps)        # (B, C, nH, nW, ps, ps)
+        patches = patches.permute(0, 2, 3, 1, 4, 5).contiguous()  # (B, nH, nW, C, ps, ps)
+        patches = patches.view(B * nH * nW, C * ps * ps)       # (B*P, d_patch)
 
-        feats = self.proj(patches).view(B * nH * nW, -1)       # (B*P, 128)
-        feats = self.fc(feats).view(B, nH * nW, -1)            # (B, P, d_f)
+        feats = self.proj(patches).view(B, nH * nW, -1)        # (B, P, d_f)
         return feats, nH, nW
 
 

@@ -777,66 +777,46 @@ $$
 
 ---
 
-### 6.2 两阶段训练范式（仿 Evo-1）
+### 6.2 三阶段渐进式训练课程
 
-借鉴 Evo-1 的两阶段训练范式：**先训集成模块与动作头，再全局微调**。结合本工程的记忆树特性，扩展为三个阶段：
+采用**模块渐进解冻**策略，共分三个阶段逐步引入模型组件与损失。每阶段 LLM 骨干（默认 Qwen2.5-0.5B）保持冻结，直至 Phase 3。
 
-#### Phase 1：SGMTS 视觉语义预训练（基于 LIBERO 观测）
+| 阶段 | 训练模块 | 损失函数 | 建议 epochs | 建议 lr |
+|---|---|---|---|---|
+| **Phase 1** 视觉预热 | SGMTS + s_proj + TreeSSMReadout + recon_decoder | $\mathcal{L}_{\text{recon}}$ | 20 | 1e-4 |
+| **Phase 2** 动作头 | （Phase 1 全部）+ CrossModalFusion + prog_head + FlowMatchingActionHead | $\mathcal{L}_{\text{flow}} + \mathcal{L}_{\text{prog}}$ | 30 | 1e-4 |
+| **Phase 3** 联合微调 | 全部参数（含 LLM） | $\mathcal{L}_{\text{flow}} + \mathcal{L}_{\text{recon}} + \mathcal{L}_{\text{prog}}$ | 10 | 1e-5 |
 
-```
-目标:   训练 SGMTS 从图像 patch 中提取任务相关语义特征
-数据:   LIBERO 全集（观测帧 + 任务语言指令对），约 360K 帧
-损失:   L_align = InfoNCE(Z^V_avg, g)          # 视觉 Token 均值与指令嵌入对齐
-        L_mst   = ||w_ij^SGMTS - w_ij^target|| # MST 一致性（语义高相关 patch 连通性）
-冻结:   LLM 骨干、动作头、记忆树模块
-训练:   SGMTS 的 W_g（语义投影）、GrootVLayer 参数
-```
-
-**目的**：让 SGMTS 在接触完整轨迹前，先学会将语言指令 $\mathbf{g}$ 映射为正确的视觉语义权重 $r_i^{\text{sem}}$，避免 Phase 2 中视觉特征尚未收敛影响记忆树结构学习。
-
-#### Phase 2：记忆树结构预训练（基于 RoboCerebra 标注）
+#### Phase 1：视觉语义预热
 
 ```
-目标:   用 RoboCerebra 层次化标注监督 HMT 的树拓扑形成过程
-数据:   RoboCerebra 完整轨迹，含子任务边界标签 {b_k}、子任务语义标签 {l_k}
-损失:   L_tree = L_recon + λ1·L_sem + λ2·L_prog + λ3·L_elev
-冻结:   LLM（完全冻结）、SGMTS（冻结 GrootVLayer，仅允许语义投影微调）
-训练:   记忆树的全部参数（节点嵌入、MLP_elev、θ_fuse 等）
+目标:   让 SGMTS + s_proj + TreeSSMReadout 建立有效的语义特征表达
+数据:   RoboCerebra 完整轨迹
+损失:   L_recon — 连续帧语义预测：recon_decoder(s_t) ≈ s_{t+1}
+        （辅助：树中父节点 s_p → 子节点均值 s_ch 的语义重建）
+冻结:   LLM、CrossModalFusion、FlowMatchingActionHead
+训练:   SGMTS、s_proj、TreeSSMReadout、recon_decoder
 ```
 
-**RoboCerebra 标注 → 损失监督的具体对应**：
-
-| RoboCerebra 标注 | 对应损失项 | 监督方式 |
-|---|---|---|
-| 子任务边界时刻 $b_k$ | $\mathcal{L}_{\text{prog}}$ | 边界前后节点构成祖先-后代正样本对 |
-| 子任务语义标签 $l_k$ | $\mathcal{L}_{\text{sem}}$ | 同子任务节点语义嵌入相似度 $> \gamma_+$ |
-| 任务 → 子任务层次 | $\mathcal{L}_{\text{elev}}$ | $v_{\text{abs}}$ 的 $\mathbf{s}_{\text{abs}}$ 对齐 GPT 生成的子任务组合描述 |
-| 完整轨迹重建 | $\mathcal{L}_{\text{recon}}$ | 从树 SSM 读取结果解码还原历史动作序列 |
-
-#### Phase 3a：动作头初始化训练（基于 LIBERO-LONG，仅训练动作相关模块）
-
-仿照 Evo-1 Stage 1，**冻结主干特征提取，仅训练集成映射层与动作头**，快速建立动作策略的初始能力：
+#### Phase 2：动作预测头训练
 
 ```
-目标:   训练 Proj_VL（融合投影）和 FlowmatchingActionHead
-数据:   LIBERO-LONG（10 任务 × 50 demos，每任务约 8 步长程操作）
-损失:   L_act = L_flow（Flow Matching 速度回归）
-冻结:   LLM、SGMTS、记忆树模块
-训练:   Proj_VL、ActionHead（L=8 层 Transformer + MLP_head）
-超参:   lr=1e-5, batch_size=16, max_steps=5,000, warmup=1,000, H_a=16
+目标:   在已收敛的视觉与记忆特征基础上训练动作生成
+数据:   RoboCerebra 完整轨迹
+损失:   L_flow  — Flow Matching 速度场 MSE（Beta(2,2) 时间采样）
+        L_prog  — 进度单调损失（维持树结构语义秩序）
+冻结:   LLM
+训练:   Phase 1 全部 + CrossModalFusion + prog_head + FlowMatchingActionHead
 ```
 
-#### Phase 3b：端到端全局微调（基于 LIBERO 全集）
-
-仿照 Evo-1 Stage 2，解冻 LLM（LoRA 微调）并以更大数据量进行全局训练：
+#### Phase 3：全参数联合微调
 
 ```
 目标:   端到端优化全模型，提升跨任务泛化与长程操作成功率
-数据:   LIBERO 全集（LIBERO-LONG 主），可混入 RoboCerebra 短轨迹片段
-损失:   L_total = L_flow + λ_tree·L_tree + λ_vis·L_SGMTS
-冻结:   无（LLM 采用 LoRA r=16，其他模块全参数）
+数据:   RoboCerebra 完整轨迹（可混入其他数据集）
+损失:   L_total = L_flow + w_recon·L_recon + w_prog·L_prog
+冻结:   无（LLM 全参数解冻，建议使用 ds_zero3.json 降低显存压力）
 训练:   全模型
-超参:   lr=1e-5, batch_size=16, max_steps=80,000, warmup=1,000, H_a=16
 ```
 
 ---
@@ -844,17 +824,14 @@ $$
 ### 6.3 总体损失函数
 
 $$
-\mathcal{L}_{\text{total}} = \underbrace{\mathcal{L}_{\text{flow}}}_{\text{Flow Matching 动作损失}} + \lambda_{\text{tree}} \underbrace{\mathcal{L}_{\text{tree}}}_{\text{记忆树结构损失}} + \lambda_{\text{vis}} \underbrace{\mathcal{L}_{\text{SGMTS}}}_{\text{视觉语义对齐}}
+\mathcal{L}_{\text{total}} = \underbrace{\mathcal{L}_{\text{flow}}}_{\text{Flow Matching 动作损失}} + w_{\text{recon}} \underbrace{\mathcal{L}_{\text{recon}}}_{\text{语义重建损失}} + w_{\text{prog}} \underbrace{\mathcal{L}_{\text{prog}}}_{\text{进度单调损失}}
 $$
 
-| 损失项 | 计算方式 | 权重 | 主要数据来源 |
+| 损失项 | 计算方式 | 权重 | 激活阶段 |
 |---|---|---|---|
-| $\mathcal{L}_{\text{flow}}$ | Flow Matching 速度场 MSE（见 5.4.7 节） | 1.0 | LIBERO |
-| $\mathcal{L}_{\text{recon}}$ | 树 SSM 输出解码历史动作的重建误差 | $\lambda_1=0.5$ | RoboCerebra |
-| $\mathcal{L}_{\text{sem}}$ | 同子任务节点语义内聚 + 跨子任务语义分离 | $\lambda_2=0.3$ | RoboCerebra 标签 |
-| $\mathcal{L}_{\text{prog}}$ | 祖先-后代对进度单调性（见 3.6 节） | $\lambda_3=0.2$ | RoboCerebra 子任务序 |
-| $\mathcal{L}_{\text{elev}}$ | $v_{\text{abs}}$ 语义嵌入与子任务组描述对齐 | $\lambda_4=0.1$ | RoboCerebra 层次标注 |
-| $\mathcal{L}_{\text{SGMTS}}$ | 视觉 Token 与指令嵌入对比对齐 | $\lambda_5=0.1$ | LIBERO 观测 |
+| $\mathcal{L}_{\text{flow}}$ | Flow Matching 速度场 MSE（Beta(2,2) 时间采样，见 5.4.7 节） | 1.0 | Phase 2-3 |
+| $\mathcal{L}_{\text{recon}}$ | `recon_decoder(s_t) ≈ s_{t+1}`（连续帧语义预测）+ 树父→子均值重建 | 0.5 | Phase 1, 3 |
+| $\mathcal{L}_{\text{prog}}$ | 祖先-后代对进度单调 hinge：$\text{mean}(\max(0,\, p_{\text{anc}} - p_{\text{desc}} + \varepsilon))$ | 0.3 | Phase 2-3 |
 
 ---
 

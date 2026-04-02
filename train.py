@@ -6,11 +6,10 @@ Supports:
   - 8-GPU (DS):   deepspeed --num_gpus 8 train.py --deepspeed \
                       --config configs/default.yaml --phase 1
 
-4-Phase training curriculum:
-  Phase 1 — Visual warm-up       (SGMTS + s_proj + tree_ssm;  L_recon)
-  Phase 2 — Structure learning   (+ fusion;                   L_prog)
-  Phase 3 — Action head          (+ action_head;              L_flow + L_prog)
-  Phase 4 — Joint fine-tuning    (+ LLM;  all losses)
+3-Phase training curriculum:
+    Phase 1 — Visual warm-up       (SGMTS + s_proj + tree_ssm;  L_recon)
+    Phase 2 — Action head          (+ fusion + prog_head + action_head;  L_flow + L_prog)
+    Phase 3 — Joint fine-tuning    (+ LLM;  all losses)
       Optionally unfreeze LLM LoRA layers + all modules
       Loss: sum of all active losses
 
@@ -33,6 +32,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
+from tqdm import tqdm
 import yaml
 
 # ── Optional DeepSpeed ─────────────────────────────────────────────
@@ -88,21 +88,19 @@ def set_trainable(model: MemoryTreeVLA, phase: int) -> List[torch.nn.Parameter]:
     """
     Freeze all params then unfreeze the modules active at this phase.
     Phase 1: SGMTS + s_proj + tree_ssm + recon_decoder
-    Phase 2: + fusion + prog_head
-    Phase 3: + action_head
-    Phase 4: + llm
+    Phase 2: + fusion + prog_head + action_head
+    Phase 3: + llm
     """
     for p in model.parameters():
         p.requires_grad_(False)
 
     train_modules: list = [model.sgmts, model.s_proj, model.tree_ssm]
-    if phase <= 2:
+    if phase == 1 or phase == 3:
         train_modules.append(model.recon_decoder)
     if phase >= 2:
         train_modules.extend([model.fusion, model.prog_head])
-    if phase >= 3:
         train_modules.append(model.action_head)
-    if phase >= 4:
+    if phase >= 3:
         train_modules.append(model.llm)
 
     trainable, seen = [], set()
@@ -136,7 +134,14 @@ def train_epoch(
     total_losses: Dict[str, float] = {}
     n_steps = 0
 
-    for batch_idx, batch in enumerate(loader):
+    pbar = tqdm(
+        loader,
+        desc     = f"Epoch {epoch:03d}",
+        disable  = not is_main_process(),
+        dynamic_ncols = True,
+        leave    = False,
+    )
+    for batch_idx, batch in enumerate(pbar):
         frames      = batch["frames"].to(device)          # (B, T, C, H, W)
         actions     = batch["actions"].to(device)         # (B, T, d_a)
         states      = batch["states"].to(device)          # (B, T, d_q)
@@ -157,16 +162,20 @@ def train_epoch(
                 states=states,
                 actions=actions,
                 subtask_ids=subtask_ids,
-                compute_flow=(phase >= 3),
+                compute_flow=(phase >= 2),
             )
             L_flow     = loss_dict.get("L_flow",  torch.tensor(0.0, device=device))
             L_recon_val = loss_dict.get("L_recon", torch.tensor(0.0, device=device))
             L_prog_val  = loss_dict.get("L_prog",  torch.tensor(0.0, device=device))
 
             # ── Combined loss ────────────────────────────────────────────
+            # Phase 1: L_flow=0 (no action head), L_prog=None (not yet)
+            # Use recon_decoder-parameter-based zero so total always has a
+            # grad_fn even when L_recon itself happens to be zero.
+            _zero = next(model.recon_decoder.parameters()).sum() * 0.0
             loss = tree_loss(
-                L_flow   = L_flow       if phase >= 3 else torch.tensor(0.0, device=device, dtype=torch.bfloat16),
-                L_recon  = L_recon_val  if phase <= 2 else None,
+                L_flow   = L_flow       if phase >= 2 else _zero,
+                L_recon  = L_recon_val  if phase == 1 or phase == 3 else None,
                 L_prog   = L_prog_val   if phase >= 2 else None,
                 w_flow   = cfg["loss"]["w_flow"],
                 w_recon  = cfg["loss"]["w_recon"],
@@ -196,6 +205,14 @@ def train_epoch(
         n_steps += 1
         global_step = global_step_offset + n_steps
 
+        # Update progress bar postfix every step (tqdm handles rate-limiting)
+        pbar.set_postfix(
+            loss  = f"{loss.item():.4f}",
+            recon = f"{L_recon_val.item():.4f}",
+            flow  = f"{L_flow.item():.4f}",
+            prog  = f"{L_prog_val.item():.4f}",
+        )
+
         if is_main_process() and (batch_idx % cfg["log_every"] == 0):
             log(
                 f"  Epoch {epoch:03d} | Step {batch_idx:04d}/{len(loader)} | "
@@ -223,7 +240,9 @@ def train_epoch(
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config",           default="configs/default.yaml")
-    parser.add_argument("--phase",            type=int, default=1)
+    parser.add_argument("--phase",            type=int, default=1, choices=[1, 2, 3])
+    parser.add_argument("--epochs",           type=int, default=None,
+                        help="Override train.epochs in the config file")
     parser.add_argument("--resume",           type=str, default=None)
     # DeepSpeed args
     parser.add_argument("--deepspeed",        action="store_true")
@@ -244,6 +263,10 @@ def main():
 
     cfg   = load_config(args.config)
     phase = args.phase
+
+    # Command-line --epochs overrides the value in the config file
+    if args.epochs is not None:
+        cfg["train"]["epochs"] = args.epochs
 
     # ── Distributed init ─────────────────────────────────────────────
     use_deepspeed = args.deepspeed or cfg.get("deepspeed", {}).get("enabled", False)
@@ -331,10 +354,10 @@ def main():
         K_elev     = cfg["model"]["K_elev"],
         delta_w    = cfg["model"]["delta_w"],
         tau        = cfg["model"]["tau"],
-        freeze_llm = (phase < 4),
+        freeze_llm = (phase < 3),
     ).to(device)
 
-    if phase >= 4 and hasattr(model.llm, "gradient_checkpointing_enable"):
+    if phase >= 3 and hasattr(model.llm, "gradient_checkpointing_enable"):
         model.llm.gradient_checkpointing_enable()
         log("LLM gradient checkpointing enabled")
 
@@ -450,25 +473,31 @@ def main():
                 and _wandb_run is not None
                 and epoch % cfg["train"]["save_every"] == 0
             ):
-                grad_norms = [
-                    p.grad.norm().item()
-                    for p in model.parameters()
+                grad_tensors = [
+                    p.grad.detach() for p in model.parameters()
                     if p.requires_grad and p.grad is not None
                 ]
-                if grad_norms:
-                    epoch_log["train/grad_norm_max"]  = max(grad_norms)
-                    epoch_log["train/grad_norm_mean"] = sum(grad_norms) / len(grad_norms)
+                if grad_tensors:
+                    # Stack norms and call .item() once to avoid per-param GPU sync
+                    all_norms = torch.stack([g.norm() for g in grad_tensors])
+                    epoch_log["train/grad_norm_max"]  = all_norms.max().item()
+                    epoch_log["train/grad_norm_mean"] = all_norms.mean().item()
             wandb_log(epoch_log, step=global_step)
 
-        if is_main_process() and epoch % cfg["train"]["save_every"] == 0:
+        if epoch % cfg["train"]["save_every"] == 0:
             tag = f"phase{phase}_epoch{epoch:04d}"
+            log(f"  ⏳ Saving checkpoint {tag} ...")
+            t_ckpt = time.time()
             if use_deepspeed:
+                # All ranks must call save_checkpoint together: DeepSpeed ZeRO
+                # gathers sharded optimizer states via collective communication.
+                # Wrapping in is_main_process() causes a cross-rank deadlock.
                 model_engine.save_checkpoint(
                     str(ckpt_dir),
                     tag          = tag,
                     client_state = {"epoch": epoch, "metrics": metrics},
                 )
-            else:
+            elif is_main_process():
                 torch.save(
                     {
                         "epoch":     epoch,
@@ -479,7 +508,7 @@ def main():
                     },
                     ckpt_dir / f"{tag}.pt",
                 )
-            log(f"  → Checkpoint: {ckpt_dir}/{tag}")
+            log(f"  ✓ Checkpoint saved: {ckpt_dir}/{tag}  ({time.time()-t_ckpt:.1f}s)")
 
     log("Training complete.")
     if use_wandb and _wandb_run is not None:

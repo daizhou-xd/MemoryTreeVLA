@@ -20,7 +20,7 @@ data:
 
 # ── Model ─────────────────────────────────────────────────────────
 model:
-  llm_path:    "checkpoints/Qwen2.5-1.5B-Instruct"
+  llm_path:    "checkpoints/Qwen2.5-0.5B"
   d:           256       # unified embedding dim
   d_a:         7         # action dim (Franka: 6D Δ-pose + gripper)
   d_q:         84        # proprioceptive state dim
@@ -31,7 +31,7 @@ model:
   H_a:         16        # action prediction horizon
   n_ode:       20        # ODE integration steps (inference)
   # Memory tree
-  theta_fuse:  0.4       # semantic distance merge threshold
+  theta_fuse:  0.35      # semantic distance merge threshold; use ~0.65 for untrained s_proj (Phase 1 cold-start), ~0.35 after Phase 1 when embeddings are coherent
   K_elev:      4         # children count elevation trigger
   delta_w:     0.1       # importance weight increment per merge
   tau:         0.1       # soft-gate temperature

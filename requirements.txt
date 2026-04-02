@@ -28,6 +28,7 @@ wandb>=0.17.0
 
 # ── Build tools（flash-attn / deepspeed 编译依赖，无 sudo 时替代 apt-get）──
 ninja>=1.11.0
+tqdm>=4.66.0
 cmake>=3.26.0
 
 # ── Utilities ─────────────────────────────────────────────────────

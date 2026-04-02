@@ -50,5 +50,6 @@
   "wall_clock_breakdown": false,
   "comms_logger": {
     "enabled": false
-  }
+  },
+  "timeout_ms": 1800000
 }

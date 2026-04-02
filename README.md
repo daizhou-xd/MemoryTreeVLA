@@ -22,7 +22,7 @@
 6. [训练](#训练)
    - [单卡调试](#单卡调试)
    - [8 卡 DeepSpeed 训练](#8-卡-deepspeed-训练)
-   - [4 阶段训练流程](#4-阶段训练流程)
+  - [3 阶段训练流程](#3-阶段训练流程)
    - [断点续训](#断点续训)
    - [Weights & Biases 可视化](#weights--biases-可视化)
 7. [评估](#评估)
@@ -40,8 +40,8 @@
 MemoryTreeVLA/
 ├── configs/
 │   ├── default.yaml          # 主训练超参数配置
-│   ├── ds_zero2.json         # DeepSpeed ZeRO-2（Phase 1-3 推荐）
-│   └── ds_zero3.json         # DeepSpeed ZeRO-3 + CPU offload（Phase 4）
+│   ├── ds_zero2.json         # DeepSpeed ZeRO-2（Phase 1-2 推荐）
+│   └── ds_zero3.json         # DeepSpeed ZeRO-3 + CPU offload（Phase 3）
 ├── dataset/
 │   ├── __init__.py
 │   └── robocerebra.py        # RoboCerebra 数据集加载器
@@ -280,7 +280,7 @@ print('instruction:', sample['instruction'])
 
 ## 模型权重下载
 
-项目使用 **Qwen2.5-1.5B-Instruct**（Phase 1-3）或 **Qwen2.5-0.5B**（快速调试）：
+项目使用 **Qwen2.5-1.5B-Instruct**（Phase 1-2）或 **Qwen2.5-0.5B**（快速调试）：
 
 ```bash
 # 方式一：从 ModelScope 下载（国内推荐）
@@ -322,15 +322,15 @@ train:
 
 deepspeed:
   enabled: false                    # 命令行 --deepspeed 覆盖
-  config:  "configs/ds_zero2.json"  # Phase 1-3；Phase 4 用 ds_zero3.json
+  config:  "configs/ds_zero2.json"  # Phase 1-2；Phase 3 用 ds_zero3.json
 ```
 
 DeepSpeed 配置对应关系：
 
 | Phase | 推荐 DeepSpeed 配置 | ZeRO 级别 | 说明 |
 |---|---|---|---|
-| 1-3 | `configs/ds_zero2.json` | ZeRO-2 | 切分优化器状态+梯度，参数整体保留 |
-| 4   | `configs/ds_zero3.json` | ZeRO-3 + CPU offload | 全参数微调，显存压力最小 |
+| 1-2 | `configs/ds_zero2.json` | ZeRO-2 | 切分优化器状态+梯度，参数整体保留 |
+| 3   | `configs/ds_zero3.json` | ZeRO-3 + CPU offload | 联合微调，显存压力最小 |
 
 ---
 
@@ -360,14 +360,11 @@ chmod +x scripts/train_8gpu.sh
 # Phase 1 — 视觉主干预热（约 20 epochs）
 bash scripts/train_8gpu.sh 1
 
-# Phase 2 — 记忆树结构学习（约 15 epochs）
+# Phase 2 — 动作预测头训练（约 30 epochs）
 bash scripts/train_8gpu.sh 2
 
-# Phase 3 — 动作预测头训练（约 30 epochs）
+# Phase 3 — 全参数联合微调（自动切换 ZeRO-3，约 10 epochs）
 bash scripts/train_8gpu.sh 3
-
-# Phase 4 — 全参数联合微调（自动切换 ZeRO-3，约 10 epochs）
-bash scripts/train_8gpu.sh 4
 ```
 
 也可手动调用 `deepspeed`：
@@ -383,14 +380,13 @@ deepspeed \
     --phase 1
 ```
 
-### 4 阶段训练流程
+### 3 阶段训练流程
 
 | 阶段 | 训练模块 | 损失函数 | 建议 epochs | 建议 lr |
 |---|---|---|---|---|
 | **Phase 1** 视觉预热 | SGMTS + s_proj + TreeSSM | $L_\text{recon}$ | 20 | 1e-4 |
-| **Phase 2** 结构学习 | + CrossModalFusion | $L_\text{recon} + L_\text{prog}$ | 15 | 5e-5 |
-| **Phase 3** 动作头 | + FlowMatchingActionHead | $L_\text{flow} + L_\text{prog}$ | 30 | 1e-4 |
-| **Phase 4** 联合微调 | + LLM（全参数） | 全部损失 | 10 | 1e-5 |
+| **Phase 2** 动作头 | + CrossModalFusion + prog_head + FlowMatchingActionHead | $L_\text{flow} + L_\text{prog}$ | 30 | 1e-4 |
+| **Phase 3** 联合微调 | + LLM（全参数） | $L_\text{flow} + L_\text{recon} + L_\text{prog}$ | 10 | 1e-5 |
 
 每阶段完成后修改 `configs/default.yaml` 中的 `train.lr` 和 `train.epochs`，再手动启动下一阶段。
 
@@ -440,7 +436,7 @@ bash scripts/train_8gpu.sh 1 configs/default.yaml \
     --wandb --wandb_project MemoryTreeVLA --wandb_tags phase1 a6000
 
 # 全阶段训练脚本（带 wandb）
-for PHASE in 1 2 3 4; do
+for PHASE in 1 2 3; do
     bash scripts/train_8gpu.sh ${PHASE} configs/default.yaml \
         --wandb --wandb_project MemoryTreeVLA --wandb_tags "phase${PHASE}"
 done
@@ -501,9 +497,9 @@ RoboCerebra 包含子任务边界标注，可计算全部指标：
 conda activate memorytree
 cd /path/to/MemoryTreeVLA
 
-# 评估 Phase 3 checkpoint
+# 评估 Phase 2（动作头）checkpoint
 python eval.py \
-    --ckpt  checkpoints/runs/phase3_epoch0030.pt \
+  --ckpt  checkpoints/runs/phase2_epoch0030.pt \
     --config configs/default.yaml \
     --dataset robocerebra \
     --data_root dataset/RoboCerebra/RoboCerebra_trainset \
@@ -511,7 +507,7 @@ python eval.py \
 
 # 只评估部分场景（快速验证）
 python eval.py \
-    --ckpt  checkpoints/runs/phase3_epoch0030.pt \
+  --ckpt  checkpoints/runs/phase2_epoch0030.pt \
     --config configs/default.yaml \
     --dataset robocerebra \
     --data_root dataset/RoboCerebra/RoboCerebra_trainset \
@@ -519,14 +515,14 @@ python eval.py \
     --max_traj 50 \
     --out results/partial_eval.json
 
-# 使用 Phase 4（联合微调）checkpoint，关闭时序下采样
+# 使用 Phase 3（联合微调）checkpoint，关闭时序下采样
 python eval.py \
-    --ckpt  checkpoints/runs/phase4_epoch0010.pt \
+  --ckpt  checkpoints/runs/phase3_epoch0010.pt \
     --config configs/default.yaml \
     --dataset robocerebra \
     --data_root dataset/RoboCerebra/RoboCerebra_trainset \
     --subsample 1 \
-    --out results/robocerebra_phase4_eval.json
+  --out results/robocerebra_phase3_eval.json
 ```
 
 ---
@@ -695,7 +691,7 @@ train:
 # 2. 增大 gradient_accumulation_steps（configs/ds_zero2.json）
 "gradient_accumulation_steps": 4
 
-# 3. 切换 ZeRO-3（Phase 1-3 也可使用）
+# 3. 切换 ZeRO-3（Phase 3 默认使用）
 bash scripts/train_8gpu.sh 1 configs/default.yaml \
     --deepspeed_config configs/ds_zero3.json
 
