@@ -170,9 +170,7 @@ def train_epoch(
 
             # ── Combined loss ────────────────────────────────────────────
             # Phase 1: L_flow=0 (no action head), L_prog=None (not yet)
-            # Use recon_decoder-parameter-based zero so total always has a
-            # grad_fn even when L_recon itself happens to be zero.
-            _zero = next(model.recon_decoder.parameters()).sum() * 0.0
+            _zero = torch.zeros((), device=device, dtype=L_flow.dtype)
             loss = tree_loss(
                 L_flow   = L_flow       if phase >= 2 else _zero,
                 L_recon  = L_recon_val  if phase == 1 or phase == 3 else None,
@@ -359,6 +357,8 @@ def main():
 
     if phase >= 3 and hasattr(model.llm, "gradient_checkpointing_enable"):
         model.llm.gradient_checkpointing_enable()
+        if hasattr(model.llm, "config") and hasattr(model.llm.config, "use_cache"):
+            model.llm.config.use_cache = False
         log("LLM gradient checkpointing enabled")
 
     # ── Trainable params ─────────────────────────────────────────────

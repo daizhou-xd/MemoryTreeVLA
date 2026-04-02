@@ -313,7 +313,7 @@ model:
   llm_path:   "checkpoints/Qwen2.5-1.5B-Instruct"
   d:          256       # 统一嵌入维度
   H_a:        16        # 动作预测步长
-  theta_fuse: 0.4       # 记忆树合并阈值（越小越易合并）
+  theta_fuse: 0.35      # 记忆树合并阈值（越小越易合并）
   K_elev:     4         # 触发语义提升的子节点数阈值
 
 train:
@@ -360,11 +360,11 @@ chmod +x scripts/train_8gpu.sh
 # Phase 1 — 视觉主干预热（约 20 epochs）
 bash scripts/train_8gpu.sh 1
 
-# Phase 2 — 动作预测头训练（约 30 epochs）
-bash scripts/train_8gpu.sh 2
+# Phase 2 — 动作预测头训练（约 30 epochs，基于 Phase 1 最优 checkpoint）
+bash scripts/train_8gpu.sh 2 --resume checkpoints/runs/phase1_epochXXXX
 
-# Phase 3 — 全参数联合微调（自动切换 ZeRO-3，约 10 epochs）
-bash scripts/train_8gpu.sh 3
+# Phase 3 — 全参数联合微调（自动切换 ZeRO-3，约 10 epochs，基于 Phase 2 最优 checkpoint）
+bash scripts/train_8gpu.sh 3 --resume checkpoints/runs/phase2_epochXXXX
 ```
 
 也可手动调用 `deepspeed`：
@@ -388,11 +388,15 @@ deepspeed \
 | **Phase 2** 动作头 | + CrossModalFusion + prog_head + FlowMatchingActionHead | $L_\text{flow} + L_\text{prog}$ | 30 | 1e-4 |
 | **Phase 3** 联合微调 | + LLM（全参数） | $L_\text{flow} + L_\text{recon} + L_\text{prog}$ | 10 | 1e-5 |
 
-每阶段完成后修改 `configs/default.yaml` 中的 `train.lr` 和 `train.epochs`，再手动启动下一阶段。
+每阶段完成后修改 `configs/default.yaml` 中的 `train.lr` 和 `train.epochs`，并通过 `--resume` 从上一阶段最佳 checkpoint 继续训练下一阶段（将 `phase*_epochXXXX` 替换为实际最佳目录）。
 
 ### 断点续训
 
 ```bash
+# 8 卡 DeepSpeed：从 Phase 1 最优 checkpoint 继续训练 Phase 2
+bash scripts/train_8gpu.sh 2 configs/default.yaml \
+  --resume checkpoints/runs/phase1_epochXXXX
+
 # 单卡（.pt 格式 checkpoint）
 python train.py \
     --config configs/default.yaml \
@@ -544,9 +548,9 @@ dataset/LIBERO/
 > **下载**：从 [LIBERO 官网](https://libero-project.github.io/) 或 [Hugging Face](https://huggingface.co/datasets/LIBERO-project/LIBERO) 下载数据集，放置到 `dataset/LIBERO/`。
 
 ```bash
-# 评估 LIBERO-LONG（主要长程测试集，对应 Phase 3a）
+# 评估 LIBERO-LONG（主要长程测试集，对应 Phase 3）
 python eval.py \
-    --ckpt  checkpoints/runs/phase3_epoch0030.pt \
+  --ckpt  checkpoints/runs/phase3_epoch0010.pt \
     --config configs/default.yaml \
     --dataset libero \
     --data_root dataset/LIBERO \
@@ -555,7 +559,7 @@ python eval.py \
 
 # 评估 LIBERO-SPATIAL（空间关系泛化）
 python eval.py \
-    --ckpt  checkpoints/runs/phase3_epoch0030.pt \
+  --ckpt  checkpoints/runs/phase3_epoch0010.pt \
     --config configs/default.yaml \
     --dataset libero \
     --data_root dataset/LIBERO \
@@ -565,7 +569,7 @@ python eval.py \
 # 评估所有子集（循环脚本）
 for SPLIT in spatial object goal long; do
     python eval.py \
-        --ckpt  checkpoints/runs/phase3_epoch0030.pt \
+    --ckpt  checkpoints/runs/phase3_epoch0010.pt \
         --config configs/default.yaml \
         --dataset libero \
         --data_root dataset/LIBERO \
@@ -575,7 +579,7 @@ done
 
 # 快速调试（每个子集只评估 20 条轨迹）
 python eval.py \
-    --ckpt  checkpoints/runs/phase3_epoch0030.pt \
+  --ckpt  checkpoints/runs/phase3_epoch0010.pt \
     --config configs/default.yaml \
     --dataset libero \
     --data_root dataset/LIBERO \
@@ -692,7 +696,7 @@ train:
 "gradient_accumulation_steps": 4
 
 # 3. 切换 ZeRO-3（Phase 3 默认使用）
-bash scripts/train_8gpu.sh 1 configs/default.yaml \
+bash scripts/train_8gpu.sh 3 configs/default.yaml \
     --deepspeed_config configs/ds_zero3.json
 
 # 4. 使用更小的 LLM（0.5B 替代 1.5B）

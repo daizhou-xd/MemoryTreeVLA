@@ -370,8 +370,7 @@ class MemoryTreeVLA(nn.Module):
         if compute_flow:
             L_flow = self._compute_flow_loss(all_Z_fused, actions, device)
         else:
-            # Differentiable zero: keeps grad_fn so DeepSpeed backward() works
-            L_flow = next(self.action_head.parameters()).sum() * 0.0
+            L_flow = torch.zeros((), device=device, dtype=actions.dtype)
 
         # ── Auxiliary losses (after full trajectory) ─────────────────
         # L_recon: consecutive-frame semantic prediction via live s (has grad)
@@ -454,7 +453,7 @@ class MemoryTreeVLA(nn.Module):
                 s_tgt_list.append(s_ch_mean.detach())
 
         if not s_src_list:
-            return (next(self.recon_decoder.parameters()).sum() * 0.0)
+            return torch.zeros((), device=device, dtype=dtype)
 
         S_src = torch.stack(s_src_list, dim=0).to(dtype=dtype)   # (N, d)
         S_tgt = torch.stack(s_tgt_list, dim=0).to(dtype=dtype)   # (N, d)
@@ -479,8 +478,8 @@ class MemoryTreeVLA(nn.Module):
                 s_desc_list.append(tree.nodes[desc_id].s)
         dtype = next(self.prog_head.parameters()).dtype
         if not s_anc_list:
-            # No ancestor-descendant pairs yet; return differentiable zero.
-            return (next(self.prog_head.parameters()).sum() * 0.0)
+            # No ancestor-descendant pairs yet.
+            return torch.zeros((), device=device, dtype=dtype)
         S_anc  = torch.stack(s_anc_list,  dim=0).to(device=device, dtype=dtype)  # (N, d)
         S_desc = torch.stack(s_desc_list, dim=0).to(device=device, dtype=dtype)  # (N, d)
         p_anc  = torch.sigmoid(self.prog_head(S_anc)).squeeze(-1)   # (N,)
