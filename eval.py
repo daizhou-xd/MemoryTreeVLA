@@ -4,8 +4,11 @@ MemoryTreeVLA — Offline Evaluation Script
 
 Benchmarks
 ----------
-  robocerebra  RoboCerebra long-horizon (NeurIPS 2025, arXiv:2506.06677)
-  libero       LIBERO-SPATIAL / OBJECT / GOAL / LONG (NeurIPS 2023, arXiv:2306.03310)
+  robocerebra       RoboCerebra trainset (long-horizon, offline)
+  robocerebra_bench RoboCerebraBench — 6 task-type subsets, structured evaluation
+                    (Ideal / Memory_Execution / Memory_Exploration /
+                     Mix / Observation_Mismatching / Random_Disturbance)
+  libero            LIBERO-SPATIAL / OBJECT / GOAL / LONG (NeurIPS 2023)
 
 Metrics
 -------
@@ -19,34 +22,49 @@ Metrics
     tree_branches        Avg branch-creation events per trajectory
     tree_elevations      Avg elevation events per trajectory
 
-  Subtask / progress  (RoboCerebra only — requires GT subtask labels)
-    subtask_boundary_f1  Branch-creation F1 vs GT subtask boundaries (±tol steps)
+  Subtask / progress  (RoboCerebra / RoboCerebraBench)
+    subtask_boundary_f1  Branch-creation F1 vs GT subtask boundaries (±tol)
     prog_monotone_rate   Fraction of (ancestor, descendant) pairs where
                          ancestor is farther from the task-goal embedding
-    subtask_sr           Fraction of GT subtask boundaries that have ≥1
-                         branch within ±boundary_tol timesteps
+    subtask_sr           Fraction of GT boundaries with ≥1 matched branch
 
 Usage
 -----
-  # RoboCerebra evaluation
+  # RoboCerebraBench — all 6 task types
   python eval.py \\
-      --ckpt  checkpoints/runs/phase3_epoch0030.pt \\
+      --ckpt  checkpoints/runs/phase3_best \\
       --config configs/default.yaml \\
+      --dataset robocerebra_bench \\
+      --bench_root dataset/RoboCerebra/RoboCerebraBench \\
+      --out results/robocerebra_bench.json
+
+  # RoboCerebraBench — specific task types only
+  python eval.py \\
+      --ckpt  checkpoints/runs/phase3_best \\
+      --dataset robocerebra_bench \\
+      --bench_root dataset/RoboCerebra/RoboCerebraBench \\
+      --task_types Ideal Random_Disturbance \\
+      --out results/bench_ideal_rd.json
+
+  # RoboCerebra trainset
+  python eval.py \\
+      --ckpt  checkpoints/runs/phase3_best \\
       --dataset robocerebra \\
       --data_root dataset/RoboCerebra/RoboCerebra_trainset \\
-      --out results/robocerebra_eval.json
+      --out results/robocerebra_train_eval.json
 
   # LIBERO-LONG evaluation
   python eval.py \\
-      --ckpt  checkpoints/runs/phase3_epoch0030.pt \\
-      --config configs/default.yaml \\
+      --ckpt  checkpoints/runs/phase3_best \\
       --dataset libero \\
       --data_root dataset/LIBERO \\
       --libero_split long \\
       --out results/libero_long_eval.json
 
-  # GPU selection, batch size, subsample
-  python eval.py --ckpt ... --dataset libero --device cuda:0 --subsample 2 --max_traj 50
+  # Quick test: limit trajectories, custom GPU
+  python eval.py --ckpt ... --dataset robocerebra_bench \\
+      --bench_root dataset/RoboCerebra/RoboCerebraBench \\
+      --device cuda:0 --subsample 4 --max_traj 20
 """
 from __future__ import annotations
 
@@ -76,16 +94,28 @@ def parse_args() -> argparse.Namespace:
                    help="YAML config used during training")
 
     # Dataset
-    p.add_argument("--dataset",  choices=["robocerebra", "libero"],
+    p.add_argument("--dataset",
+                   choices=["robocerebra", "robocerebra_bench", "libero"],
                    required=True, help="Which benchmark to evaluate")
-    p.add_argument("--data_root", required=True,
-                   help="Root directory of the dataset")
+    p.add_argument("--data_root", default=None,
+                   help="Root directory of the dataset (robocerebra / libero)")
+    # RoboCerebraBench-specific arguments
+    p.add_argument("--bench_root",
+                   default="dataset/RoboCerebra/RoboCerebraBench",
+                   help="Root directory of RoboCerebraBench "
+                        "(used when --dataset robocerebra_bench)")
+    p.add_argument("--task_types", nargs="*", default=None,
+                   metavar="TASK_TYPE",
+                   help="(robocerebra_bench) Task-type subsets to evaluate. "
+                        "Choices: Ideal Memory_Execution Memory_Exploration "
+                        "Mix Observation_Mismatching Random_Disturbance. "
+                        "Default: all six.")
     p.add_argument("--libero_split",
                    choices=["spatial", "object", "goal", "long"],
                    default="long",
                    help="LIBERO subset (only used when --dataset libero)")
     p.add_argument("--scenes",   nargs="*", default=None,
-                   help="(RoboCerebra) scene sub-folders to include, e.g. "
+                   help="(RoboCerebra trainset) scene sub-folders to include, e.g. "
                         "coffee_table kitchen_table")
     p.add_argument("--subsample", type=int, default=None,
                    help="Temporal subsample (overrides config)")
@@ -141,7 +171,7 @@ def load_model(ckpt_path: str, cfg: dict, device: torch.device):
         patch_size = m_cfg.get("patch_size", 16),
         H_a        = m_cfg.get("H_a", 16),
         n_ode      = m_cfg.get("n_ode", 20),
-        theta_fuse = m_cfg.get("theta_fuse", 0.4),
+        theta_fuse = m_cfg.get("theta_fuse", 0.35),
         K_elev     = m_cfg.get("K_elev", 4),
         delta_w    = m_cfg.get("delta_w", 0.1),
         tau        = m_cfg.get("tau", 0.1),
@@ -289,6 +319,7 @@ def evaluate_trajectory(
     device: torch.device,
     has_subtask_labels: bool = False,
     subtask_ids: Optional[torch.Tensor] = None,   # (T,) int
+    boundary_tol: int = 5,
 ) -> Dict:
     """
     Run one trajectory through model.step(), collecting per-step metrics.
@@ -359,7 +390,7 @@ def evaluate_trajectory(
                 gt_bounds.append(t)
 
         # Boundary F1
-        tp, fp, fn = compute_boundary_matches(branch_steps, gt_bounds, tol=5)
+        tp, fp, fn = compute_boundary_matches(branch_steps, gt_bounds, tol=boundary_tol)
         result["subtask_boundary_f1"] = f1_from_counts(tp, fp, fn)
 
         # Subtask success rate: fraction of GT boundaries with ≥1 matched branch
@@ -370,6 +401,85 @@ def evaluate_trajectory(
         result["prog_monotone_rate"] = compute_prog_monotone_rate(tree)
 
     return result
+
+
+# ================================================================
+#  Per-trajectory runner (shared by all dataset modes)
+# ================================================================
+
+def _eval_trajectories(
+    model,
+    ds,
+    n_traj: int,
+    device: torch.device,
+    has_subtask_labels: bool,
+    boundary_tol: int,
+    show_task_type: bool = False,
+) -> List[Dict]:
+    """Iterate over dataset, run evaluate_trajectory, return per-traj results."""
+    all_results: List[Dict] = []
+    t0 = time.time()
+
+    for idx in range(n_traj):
+        sample = ds[idx]
+
+        frames      = sample["frames"]           # (T, 3, H, W)
+        actions     = sample["actions"]          # (T, 7)
+        states      = sample["states"]           # (T, d_q)
+        instruction = sample["instruction"]
+        subtask_ids = sample.get("subtask_ids")  # (T,) or None
+
+        traj_result = evaluate_trajectory(
+            model              = model,
+            frames             = frames,
+            actions            = actions,
+            states             = states,
+            instruction        = instruction,
+            device             = device,
+            has_subtask_labels = has_subtask_labels,
+            subtask_ids        = subtask_ids,
+            boundary_tol       = boundary_tol,
+        )
+        traj_result["trajectory_idx"] = idx
+        traj_result["instruction"]    = instruction
+        if show_task_type:
+            traj_result["task_type"] = sample.get("task_type", "")
+            traj_result["case_name"] = sample.get("case_name", "")
+        all_results.append(traj_result)
+
+        if (idx + 1) % 10 == 0 or idx == n_traj - 1:
+            elapsed = time.time() - t0
+            fps = (idx + 1) / max(elapsed, 1e-6)
+            tt_tag = (
+                f"[{traj_result.get('task_type', '')}] "
+                if show_task_type else ""
+            )
+            print(
+                f"  [{idx+1:>4}/{n_traj}] {tt_tag}"
+                f"L1={traj_result.get('action_l1', 0):.4f}  "
+                f"L2={traj_result.get('action_l2', 0):.4f}  "
+                f"nodes={traj_result.get('tree_nodes', 0):.1f}  "
+                f"depth={traj_result.get('tree_depth', 0):.1f}  "
+                f"({fps:.2f} traj/s)"
+            )
+
+    return all_results
+
+
+def _print_summary_table(title: str, summary: Dict[str, float]) -> None:
+    w = 60
+    print(f"\n{'=' * w}")
+    print(f"  {title}")
+    print(f"{'-' * w}")
+    print(f"  {'Metric':<33} {'Value':>10}")
+    print(f"{'-' * w}")
+    # Show mean metrics first (skip *_std lines)
+    for k, v in summary.items():
+        if not k.endswith("_std"):
+            std = summary.get(f"{k}_std", None)
+            std_str = f"  ±{std:.4f}" if std is not None else ""
+            print(f"  {k:<33} {v:>10.4f}{std_str}")
+    print(f"{'=' * w}")
 
 
 # ================================================================
@@ -392,11 +502,18 @@ def run_evaluation(args: argparse.Namespace):
     print(f"Loading model from {args.ckpt} ...")
     model = load_model(args.ckpt, cfg, device)
 
-    # ── Build dataset ────────────────────────────────────────────────
+    # ── Dispatch per dataset mode ────────────────────────────────────
+    if args.dataset == "robocerebra_bench":
+        return _run_bench_evaluation(args, cfg, model, device,
+                                     data_cfg, subsample, max_seqlen)
+
+    # ── Build dataset (robocerebra trainset or libero) ────────────────
     print(f"Building dataset ({args.dataset}) ...")
     has_subtask_labels = (args.dataset == "robocerebra")
 
     if args.dataset == "robocerebra":
+        if args.data_root is None:
+            raise ValueError("--data_root is required for dataset=robocerebra")
         from dataset import RoboCerebraDataset
         ds = RoboCerebraDataset(
             root       = args.data_root,
@@ -407,6 +524,8 @@ def run_evaluation(args: argparse.Namespace):
             max_seqlen = max_seqlen,
         )
     else:   # libero
+        if args.data_root is None:
+            raise ValueError("--data_root is required for dataset=libero")
         from dataset.libero import LIBERODataset
         ds = LIBERODataset(
             root       = args.data_root,
@@ -423,74 +542,157 @@ def run_evaluation(args: argparse.Namespace):
         n_traj = min(n_traj, args.max_traj)
     print(f"Evaluating {n_traj} trajectories ...")
 
-    # ── Per-trajectory evaluation ─────────────────────────────────────
-    all_results: List[Dict] = []
-    t0 = time.time()
+    all_results = _eval_trajectories(
+        model, ds, n_traj, device,
+        has_subtask_labels=has_subtask_labels,
+        boundary_tol=args.boundary_tol,
+    )
 
-    for idx in range(n_traj):
-        sample = ds[idx]
-
-        frames      = sample["frames"]          # (T, 3, H, W)
-        actions     = sample["actions"]         # (T, 7)
-        states      = sample["states"]          # (T, d_q)
-        instruction = sample["instruction"]
-        subtask_ids = sample.get("subtask_ids") # (T,) or None
-
-        traj_result = evaluate_trajectory(
-            model         = model,
-            frames        = frames,
-            actions       = actions,
-            states        = states,
-            instruction   = instruction,
-            device        = device,
-            has_subtask_labels = has_subtask_labels,
-            subtask_ids   = subtask_ids,
-        )
-        traj_result["trajectory_idx"] = idx
-        traj_result["instruction"]    = instruction
-        all_results.append(traj_result)
-
-        # Progress print
-        if (idx + 1) % 10 == 0 or idx == n_traj - 1:
-            elapsed = time.time() - t0
-            fps = (idx + 1) / elapsed
-            print(
-                f"  [{idx+1:>4}/{n_traj}]  "
-                f"L1={traj_result.get('action_l1', 0):.4f}  "
-                f"L2={traj_result.get('action_l2', 0):.4f}  "
-                f"nodes={traj_result.get('tree_nodes', 0):.1f}  "
-                f"depth={traj_result.get('tree_depth', 0):.1f}  "
-                f"({fps:.2f} traj/s)"
-            )
-
-    # ── Aggregate ────────────────────────────────────────────────────
     summary = aggregate_results(all_results, has_subtask_labels)
+    _print_summary_table("RESULTS", summary)
 
-    print("\n" + "=" * 60)
-    print(f"{'Metric':<35} {'Value':>10}")
-    print("-" * 60)
-    for k, v in summary.items():
-        print(f"  {k:<33} {v:>10.4f}")
-    print("=" * 60)
-
-    # ── Save ─────────────────────────────────────────────────────────
     if args.out:
         out_path = Path(args.out)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
-            "config":          args.config,
-            "checkpoint":      args.ckpt,
-            "dataset":         args.dataset,
-            "libero_split":    args.libero_split if args.dataset == "libero" else None,
-            "n_trajectories":  n_traj,
-            "summary":         summary,
-            "per_trajectory":  all_results,
+            "config":         args.config,
+            "checkpoint":     args.ckpt,
+            "dataset":        args.dataset,
+            "libero_split":   args.libero_split if args.dataset == "libero" else None,
+            "n_trajectories": n_traj,
+            "summary":        summary,
+            "per_trajectory": all_results,
         }
         with open(out_path, "w") as f:
             json.dump(payload, f, indent=2)
         print(f"\nResults saved to {out_path}")
 
     return summary
+
+
+# ================================================================
+#  RoboCerebraBench structured evaluation
+# ================================================================
+
+def _run_bench_evaluation(
+    args: argparse.Namespace,
+    cfg: dict,
+    model,
+    device: torch.device,
+    data_cfg: dict,
+    subsample: int,
+    max_seqlen: int,
+) -> Dict:
+    """
+    Evaluate on RoboCerebraBench with per-task-type breakdown.
+
+    Follows the task-type categorisation in the original RoboCerebra eval
+    (eval_openvla.py):
+      Ideal                  — standard long-horizon tasks
+      Memory_Execution       — tests memory-guided execution
+      Memory_Exploration     — tests memory-guided exploration
+      Mix                    — dynamic disturbance + observation shift
+      Observation_Mismatching— shifted observation description
+      Random_Disturbance     — random object disturbances during execution
+
+    Since MemoryTreeVLA is evaluated offline (no simulation), we measure:
+      action_l1 / action_l2          — action-prediction quality
+      tree_nodes / tree_depth /
+      tree_branches / tree_elevations — memory-tree structure
+      subtask_boundary_f1 / subtask_sr
+      prog_monotone_rate              — subtask-aware metrics
+    """
+    from dataset.robocerebra_bench import (
+        RoboCerebraBenchDataset,
+        BENCH_TASK_TYPES,
+    )
+
+    bench_root = args.bench_root
+    task_types = args.task_types  # None → all six
+
+    print(f"Building RoboCerebraBench dataset ...")
+    print(f"  Root      : {bench_root}")
+    print(f"  Task types: {task_types or BENCH_TASK_TYPES}")
+
+    full_ds = RoboCerebraBenchDataset(
+        root       = bench_root,
+        task_types = task_types,
+        img_h      = data_cfg.get("img_h", 224),
+        img_w      = data_cfg.get("img_w", 224),
+        subsample  = subsample,
+        max_seqlen = max_seqlen,
+    )
+
+    n_total = len(full_ds)
+    if args.max_traj is not None:
+        n_total = min(n_total, args.max_traj)
+
+    if n_total == 0:
+        print("[WARN] No cases found. Check --bench_root and --task_types.")
+        return {}
+
+    print(f"Evaluating {n_total} cases ...")
+
+    # ── Per-trajectory evaluation ─────────────────────────────────────
+    all_results = _eval_trajectories(
+        model, full_ds, n_total, device,
+        has_subtask_labels=True,   # bench always has step annotations
+        boundary_tol=args.boundary_tol,
+        show_task_type=True,
+    )
+
+    # ── Per-task-type aggregation ─────────────────────────────────────
+    effective_task_types = task_types or BENCH_TASK_TYPES
+    per_type_results: Dict[str, Dict] = {}
+
+    print(f"\n{'=' * 70}")
+    print("  PER TASK-TYPE RESULTS  (RoboCerebraBench)")
+    print(f"{'=' * 70}")
+
+    for tt in effective_task_types:
+        tt_rows = [r for r in all_results if r.get("task_type") == tt]
+        if not tt_rows:
+            continue
+        tt_summary = aggregate_results(tt_rows, has_subtask_labels=True)
+        per_type_results[tt] = {
+            "n_cases": len(tt_rows),
+            "metrics": tt_summary,
+        }
+        # Print compact row
+        print(
+            f"  {tt:<30} n={len(tt_rows):>3}  "
+            f"L1={tt_summary.get('action_l1', 0):.4f}  "
+            f"L2={tt_summary.get('action_l2', 0):.4f}  "
+            f"F1={tt_summary.get('subtask_boundary_f1', 0):.4f}  "
+            f"SR={tt_summary.get('subtask_sr', 0):.4f}  "
+            f"mono={tt_summary.get('prog_monotone_rate', 0):.4f}"
+        )
+
+    # ── Overall summary ───────────────────────────────────────────────
+    overall = aggregate_results(all_results, has_subtask_labels=True)
+    _print_summary_table("OVERALL SUMMARY", overall)
+
+    # ── Save ──────────────────────────────────────────────────────────
+    if args.out:
+        out_path = Path(args.out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "config":          args.config,
+            "checkpoint":      args.ckpt,
+            "dataset":         "robocerebra_bench",
+            "bench_root":      bench_root,
+            "task_types":      task_types or BENCH_TASK_TYPES,
+            "n_cases":         n_total,
+            "boundary_tol":    args.boundary_tol,
+            "overall_summary": overall,
+            "per_task_type":   per_type_results,
+            "per_case":        all_results,
+        }
+        with open(out_path, "w") as f:
+            json.dump(payload, f, indent=2)
+        print(f"\nResults saved to {out_path}")
+
+    return overall
 
 
 # ================================================================

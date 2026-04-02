@@ -27,7 +27,8 @@
    - [Weights & Biases 可视化](#weights--biases-可视化)
 7. [评估](#评估)
    - [评估指标](#评估指标)
-   - [RoboCerebra 评估](#robocerebra-评估)
+   - [RoboCerebraBench 评估](#robocerebra_bench-评估)
+   - [RoboCerebra 训练集评估](#robocerebra-trainset-评估)
    - [LIBERO 评估](#libero-评估)
    - [结果解读](#结果解读)
 8. [常见问题](#常见问题)
@@ -44,7 +45,8 @@ MemoryTreeVLA/
 │   └── ds_zero3.json         # DeepSpeed ZeRO-3 + CPU offload（Phase 3）
 ├── dataset/
 │   ├── __init__.py
-│   └── robocerebra.py        # RoboCerebra 数据集加载器
+│   ├── robocerebra.py        # RoboCerebra 训练集加载器
+│   └── robocerebra_bench.py  # RoboCerebraBench 六子集评测加载器
 ├── losses/
 │   ├── __init__.py
 │   └── tree_losses.py        # L_recon / L_sem / L_prog / L_elev
@@ -276,6 +278,49 @@ print('instruction:', sample['instruction'])
 "
 ```
 
+### RoboCerebraBench 评测数据集
+
+RoboCerebraBench 是官方基准测试集，包含六种任务类型（各 10 个 case），已下载至：
+
+```
+dataset/RoboCerebra/RoboCerebraBench/
+    Ideal/                    # 标准长时序任务
+    Memory_Execution/         # 记忆引导执行
+    Memory_Exploration/       # 记忆引导探索
+    Mix/                      # 动态扰动 + 观测偏移混合
+    Observation_Mismatching/  # 观测描述偏移
+    Random_Disturbance/       # 随机物体扰动
+        case1/
+            demo.hdf5            # 动作(T,7) + 状态(T,71)
+            case1.mp4
+            task_description.txt # 子任务步骤与时间戳
+            goal.json            # 目标条件
+            *.bddl
+```
+
+若数据丢失可重新下载：
+
+```bash
+pip install -U huggingface_hub
+hf download qiukingballball/RoboCerebra \
+    --type dataset \
+    --include "RoboCerebraBench/**" \
+    --local-dir dataset/RoboCerebra
+```
+
+验证加载：
+
+```bash
+python -c "
+from dataset.robocerebra_bench import RoboCerebraBenchDataset, BENCH_TASK_TYPES
+ds = RoboCerebraBenchDataset('dataset/RoboCerebra/RoboCerebraBench')
+print(f'Total cases: {len(ds)}')
+for tt in BENCH_TASK_TYPES:
+    n = sum(1 for c in ds.cases if c.task_type == tt)
+    print(f'  {tt}: {n}')
+"
+```
+
 ---
 
 ## 模型权重下载
@@ -477,7 +522,7 @@ wandb sync wandb/offline-run-*
 
 ### 评估指标
 
-`eval.py` 支持对以下两个基准进行**离线轨迹评估**（offline trajectory evaluation），使用 teacher-forcing 方式逐帧喂入模型，对比预测动作与真值动作：
+`eval.py` 支持对以下三个基准进行**离线轨迹评估**（offline trajectory evaluation），使用 teacher-forcing 方式逐帧喂入模型，对比预测动作与真值动作：
 
 | 指标 | 说明 | 适用数据集 |
 |---|---|---|
@@ -487,46 +532,95 @@ wandb sync wandb/offline-run-*
 | `tree_depth` | 轨迹末尾记忆树最大深度（均值） | 全部 |
 | `tree_branches` | 每条轨迹分支创建次数（语义跳变次数） | 全部 |
 | `tree_elevations` | 每条轨迹语义提升（elevation）次数 | 全部 |
-| `subtask_boundary_f1` | 分支创建事件与 GT 子任务边界的 F1（±5 步容忍） | RoboCerebra |
-| `subtask_sr` | GT 子任务边界中被正确检测到的比例 | RoboCerebra |
-| `prog_monotone_rate` | 树中祖先-后代对语义进度单调的比例 | RoboCerebra |
+| `subtask_boundary_f1` | 分支创建事件与 GT 子任务边界的 F1（±`boundary_tol` 步容忍） | RoboCerebra / Bench |
+| `subtask_sr` | GT 子任务边界中被正确检测到的比例 | RoboCerebra / Bench |
+| `prog_monotone_rate` | 树中祖先-后代对语义进度单调的比例 | RoboCerebra / Bench |
 
 ---
 
-### RoboCerebra 评估
+### RoboCerebraBench 评估 {#robocerebra_bench-评估}
 
-RoboCerebra 包含子任务边界标注，可计算全部指标：
+RoboCerebraBench 是官方基准集，包含 6 种任务类型各 10 个 case，评估结果自动按任务类型分组汇报。
 
 ```bash
 conda activate memorytree
 cd /path/to/MemoryTreeVLA
 
-# 评估 Phase 2（动作头）checkpoint
+# 评估全部 6 种任务类型（推荐，最终上报结果时使用）
 python eval.py \
-  --ckpt  checkpoints/runs/phase2_epoch0030.pt \
+    --ckpt  checkpoints/runs/phase3_best \
+    --config configs/default.yaml \
+    --dataset robocerebra_bench \
+    --bench_root dataset/RoboCerebra/RoboCerebraBench \
+    --out results/bench_eval.json
+
+# 只评估特定子集
+python eval.py \
+    --ckpt  checkpoints/runs/phase3_best \
+    --dataset robocerebra_bench \
+    --bench_root dataset/RoboCerebra/RoboCerebraBench \
+    --task_types Ideal Random_Disturbance Memory_Execution \
+    --out results/bench_partial.json
+
+# 快速调试（限制数量 + CPU）
+python eval.py \
+    --ckpt  checkpoints/runs/phase3_best \
+    --dataset robocerebra_bench \
+    --bench_root dataset/RoboCerebra/RoboCerebraBench \
+    --max_traj 6 \
+    --device cpu
+```
+
+**典型输出**（`robocerebra_bench`）：
+
+```
+======================================================================
+  PER TASK-TYPE RESULTS  (RoboCerebraBench)
+======================================================================
+  Ideal                          n= 10  L1=0.0812  L2=0.1534  F1=0.7241  SR=0.7833  mono=0.8901
+  Memory_Execution               n= 10  L1=0.0891  L2=0.1672  F1=0.6823  SR=0.7500  mono=0.8745
+  Memory_Exploration             n= 10  L1=0.0934  L2=0.1758  F1=0.6512  SR=0.7167  mono=0.8612
+  Mix                            n= 10  L1=0.1023  L2=0.1921  F1=0.6102  SR=0.6833  mono=0.8401
+  Observation_Mismatching        n= 10  L1=0.0967  L2=0.1813  F1=0.6321  SR=0.7000  mono=0.8534
+  Random_Disturbance             n= 10  L1=0.0988  L2=0.1856  F1=0.6234  SR=0.6917  mono=0.8478
+
+============================================================
+  OVERALL SUMMARY
+------------------------------------------------------------
+  Metric                              Value
+------------------------------------------------------------
+  action_l1                        0.0936  ±0.0287
+  action_l2                        0.1759  ±0.0541
+  subtask_boundary_f1              0.6539  ±0.1203
+  subtask_sr                       0.7208  ±0.0891
+  prog_monotone_rate               0.8612  ±0.0412
+============================================================
+Results saved to results/bench_eval.json
+```
+
+---
+
+### RoboCerebra Trainset 评估 {#robocerebra-trainset-评估}
+
+RoboCerebra 训练集包含子任务边界标注，可用于验证集检验 checkpoint 泛化能力：
+
+```bash
+# 评估 Phase 3 最优 checkpoint
+python eval.py \
+    --ckpt  checkpoints/runs/phase3_best \
     --config configs/default.yaml \
     --dataset robocerebra \
     --data_root dataset/RoboCerebra/RoboCerebra_trainset \
-    --out results/robocerebra_eval.json
+    --out results/robocerebra_train_eval.json
 
 # 只评估部分场景（快速验证）
 python eval.py \
-  --ckpt  checkpoints/runs/phase2_epoch0030.pt \
-    --config configs/default.yaml \
+    --ckpt  checkpoints/runs/phase3_best \
     --dataset robocerebra \
     --data_root dataset/RoboCerebra/RoboCerebra_trainset \
     --scenes coffee_table kitchen_table \
     --max_traj 50 \
     --out results/partial_eval.json
-
-# 使用 Phase 3（联合微调）checkpoint，关闭时序下采样
-python eval.py \
-  --ckpt  checkpoints/runs/phase3_epoch0010.pt \
-    --config configs/default.yaml \
-    --dataset robocerebra \
-    --data_root dataset/RoboCerebra/RoboCerebra_trainset \
-    --subsample 1 \
-  --out results/robocerebra_phase3_eval.json
 ```
 
 ---
@@ -596,9 +690,12 @@ python eval.py \
 |---|---|---|
 | `--ckpt` | 必填 | `.pt` 模型文件（单卡）或 DeepSpeed checkpoint 目录 |
 | `--config` | `configs/default.yaml` | 与训练时使用的 YAML 配置文件 |
-| `--dataset` | 必填 | `robocerebra` 或 `libero` |
-| `--data_root` | 必填 | 数据集根目录 |
+| `--dataset` | 必填 | `robocerebra_bench` / `robocerebra` / `libero` |
+| `--bench_root` | `dataset/RoboCerebra/RoboCerebraBench` | RoboCerebraBench 根目录（`robocerebra_bench` 专用） |
+| `--task_types` | 全 6 类 | 仅评估指定子集，空格分隔，如 `Ideal Random_Disturbance` |
+| `--data_root` | 无 | 数据集根目录（`robocerebra` / `libero` 专用） |
 | `--libero_split` | `long` | LIBERO 子集：`spatial`, `object`, `goal`, `long` |
+| `--scenes` | 全部 | RoboCerebra 训练集场景筛选，如 `coffee_table kitchen_table` |
 | `--subsample` | 来自 config | 时序下采样（1 = 每帧，4 = 每 4 帧） |
 | `--max_traj` | 全部 | 限制评估轨迹数（调试用） |
 | `--max_seqlen` | 来自 config | 截断长轨迹到该步数 |
@@ -610,33 +707,36 @@ python eval.py \
 
 ### 结果解读
 
-**典型输出示例**（RoboCerebra）：
+`robocerebra_bench` 模式下结果 JSON 结构：
 
-```
-============================================================
-Metric                              Value
-------------------------------------------------------------
-  action_l1                        0.0823
-  action_l1_std                    0.0341
-  action_l2                        0.1547
-  action_l2_std                    0.0612
-  tree_nodes                       8.3000
-  tree_depth                       2.4000
-  tree_branches                    5.7000
-  tree_elevations                  1.2000
-  subtask_boundary_f1              0.7134
-  subtask_sr                       0.7812
-  prog_monotone_rate               0.8923
-============================================================
-Results saved to results/robocerebra_eval.json
+```json
+{
+  "checkpoint": "checkpoints/runs/phase3_best",
+  "dataset": "robocerebra_bench",
+  "task_types": ["Ideal", "Memory_Execution", ...],
+  "n_cases": 60,
+  "overall_summary": {
+    "action_l1": 0.0936, "action_l1_std": 0.0287,
+    "subtask_boundary_f1": 0.6539,
+    "prog_monotone_rate": 0.8612
+  },
+  "per_task_type": {
+    "Ideal":      {"n_cases": 10, "metrics": {...}},
+    "Mix":        {"n_cases": 10, "metrics": {...}}
+  },
+  "per_case": [...]
+}
 ```
 
 **指标解读**：
 
-- `action_l1 / l2`：越小越好，表示预测动作与真值的平均偏差
-- `tree_nodes / depth`：反映记忆树规模，过大说明阈值偏小，过小说明阈值偏大
-- `subtask_boundary_f1`：越接近 1.0 说明模型越准确地感知到子任务切换时机
-- `prog_monotone_rate`：越接近 1.0 说明树结构中时序语义层次越清晰
+| 指标 | 良好范围 | 含义 |
+|---|---|---|
+| `action_l1 / l2` | 越小越好 | 预测动作与真值的平均偏差 |
+| `tree_nodes / depth` | 与任务复杂度匹配 | 过大 → `theta_fuse` 偏小；过小 → 偏大 |
+| `subtask_boundary_f1` | 接近 1.0 | 模型感知子任务切换的准确度 |
+| `subtask_sr` | 接近 1.0 | GT 边界被成功检测的比例 |
+| `prog_monotone_rate` | 接近 1.0 | 树中时序语义层次的清晰程度 |
 
 ---
 
