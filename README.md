@@ -69,7 +69,7 @@ DualTreeVLA/
 │   │   ├── robocerebra.py        # RoboCerebra 训练集加载器
 │   │   └── robocerebra_bench.py  # RoboCerebraBench 六子集评测加载器
 │   ├── losses/
-│   │   └── tree_losses.py        # l_boundary / l_sem / l_elev
+│   │   └── tree_losses.py        # l_boundary / l_sem
 │   └── model/
 │       ├── attn.py               # FlashMHA（自动选择 Flash Attn 2 / SDPA）
 │       ├── fusion.py             # CrossModalFusion（门控融合）
@@ -372,14 +372,14 @@ model:
 
 ```
 全模型预训练（RoboCerebra）  ──→  Phase 1（LIBERO）  ──→  Phase 2（LIBERO）
-  L_boundary + L_sem + L_elev        L_flow only              L_flow only
+  L_boundary + L_sem                 L_flow only              L_flow only
   SGMTS adapter + JumpAwareHead      CrossModalFusion          全部模块
   TreeSSM + MLPElevation             FlowMatchingHead          LLM: 0.1× LR
 ```
 
 | 阶段 | 数据集 | 可训练模块 | 损失函数 | 脚本 |
 |---|---|---|---|---|
-| **全模型预训练** | RoboCerebra | SGMTS adapter, JumpAwareHead, TreeSSM, MLPElevation | $L_\text{boundary}+L_\text{sem}+L_\text{elev}$ | `pretrain.sh` |
+| **全模型预训练** | RoboCerebra | SGMTS adapter, JumpAwareHead, TreeSSM, MLPElevation | $L_\text{boundary}+L_\text{sem}$ | `pretrain.sh` |
 | **Phase 1** | LIBERO | CrossModalFusion, FlowMatchingActionHead | $L_\text{flow}$ | `train_phase1.sh` |
 | **Phase 2** | LIBERO | 全部模块 | $L_\text{flow}$ | `train_phase2.sh` |
 

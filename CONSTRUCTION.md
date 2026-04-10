@@ -550,7 +550,7 @@ RoboCerebra                           冻结: LLM +           冻结: 无
     JumpAwareHead,                     可训练: Fusion,            (LLM: 0.1× LR)
     TreeSSM, MLPElevation                      FlowHead
   · 损失: L_boundary                   损失: L_flow          损失: L_flow
-    + L_sem + L_elev                      （仅此一项）            （仅此一项）
+    + L_sem                               （仅此一项）            （仅此一项）
 
 脚本: scripts/pretrain.py             脚本: scripts/train.py --phase 1/2
 配置: configs/pretrain.yaml           配置: configs/train_phase1/2.yaml
@@ -591,12 +591,12 @@ RoboCerebra                           冻结: LLM +           冻结: 无
 > **最重要的设计约束**：语义相关损失与 FlowMatching 损失不能混合在同一训练阶段。
 
 ```
-全模型预训练（RoboCerebra）   →  L_boundary + L_sem + L_elev
+全模型预训练（RoboCerebra）   →  L_boundary + L_sem
 第一阶段训练（LIBERO）        →  L_flow  ← 仅此一项
 第二阶段训练（LIBERO）        →  L_flow  ← 仅此一项
 ```
 
-> **关于 CLIP 预训练**：CLIP Vision Encoder 的权重在整个训练流程中保持冻结，无需任何分类损失（已弃用的 L_cls 已从项目中移除）。CLIP 的语义能力来自其自身的预训练，与本项目的三个损失函数完全解耦。
+> **关于 CLIP 预训练**：CLIP Vision Encoder 的权重在整个训练流程中保持冻结，无需任何分类损失（已弃用的 L_cls 已从项目中移除）。CLIP 的语义能力来自其自身的预训练，与本项目的两个损失函数完全解耦。
 ---
 
 ## 6. 损失函数详解
@@ -621,18 +621,11 @@ $$\mathcal{L}_\text{sem} = -\frac{1}{N}\sum_{i=1}^N \log \frac{\exp(s_i^\top s_i
 - $s_i^\text{text} \in \mathbb{R}^d$：对应真实子任务描述的语言嵌入（LLM 编码，冻结）
 - $\tau = 0.07$：InfoNCE 温度
 
-#### `l_elev` — 语义提升一致性 MSE
-
-$$\mathcal{L}_\text{elev} = \frac{1}{M}\sum_{k=1}^M \left\|s_k^\text{abs} - \frac{\sum_i w_i\,s_i^{(k)}}{\sum_i w_i}\right\|_2^2$$
-
-- $s_k^\text{abs}$：第 $k$ 个抽象节点的语义嵌入
-- $s_i^{(k)},\, w_i$：其子节点语义嵌入及权重
-
 #### 预训练总损失
 
-$$\mathcal{L}_\text{pretrain} = w_b\,\mathcal{L}_\text{boundary} + w_s\,\mathcal{L}_\text{sem} + w_e\,\mathcal{L}_\text{elev}$$
+$$\mathcal{L}_\text{pretrain} = w_b\,\mathcal{L}_\text{boundary} + w_s\,\mathcal{L}_\text{sem}$$
 
-默认权重：$w_b = 1.0,\; w_s = 0.5,\; w_e = 0.2$
+默认权重：$w_b = 1.0,\; w_s = 0.5$
 
 ### 6.2 Phase 1/2 损失
 
@@ -665,7 +658,7 @@ losses = model(
 
 | `mode` | 返回 dict 的键 | 实际计算的损失 |
 |--------|--------------|--------------|
-| `'pretrain'` | `L_boundary`, `L_sem`, `total` | $\mathcal{L}_b + \mathcal{L}_s + \mathcal{L}_e$ |
+| `'pretrain'` | `L_boundary`, `L_sem`, `total` | $\mathcal{L}_b + \mathcal{L}_s$ |
 | `'phase1'` | `L_flow`, `total` | $\mathcal{L}_\text{flow}$ only |
 | `'phase2'` | `L_flow`, `total` | $\mathcal{L}_\text{flow}$ only |
 
@@ -680,7 +673,7 @@ DualTreeVLA/
 ├── requirements.txt
 │
 ├── configs/
-│   ├── pretrain.yaml            ← 预训练配置（L_boundary+L_sem+L_elev，无 L_flow）
+│   ├── pretrain.yaml            ← 预训练配置（L_boundary+L_sem，无 L_flow）
 │   ├── train_phase1.yaml        ← Phase 1 配置（仅 L_flow，冻结 LLM）
 │   ├── train_phase2.yaml        ← Phase 2 配置（仅 L_flow，全量微调）
 │   ├── ds_zero2.json            ← DeepSpeed ZeRO-2（Phase 1 推荐）
@@ -714,7 +707,7 @@ DualTreeVLA/
 │   │       │                       PatchCNN：轻量 fallback
 │   │       └── __init__.py
 │   ├── losses/
-│   │   ├── tree_losses.py       ← l_boundary, l_sem, l_elev（预训练）/ stubs
+│   │   ├── tree_losses.py       ← l_boundary, l_sem（预训练）/ stubs
 │   │   └── __init__.py
 │   └── dataset/
 │       ├── robocerebra.py       ← RoboCerebra 预训练数据集

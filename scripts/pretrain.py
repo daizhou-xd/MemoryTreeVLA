@@ -12,7 +12,6 @@ DualTreeVLA 预训练脚本 — 语义边界结构学习
 损失（完全不包含 FlowMatching）:
   L_boundary  — 动作突变边界 BCE（自监督或 RoboCerebra 标注）
   L_sem       — 分支点语义 InfoNCE（需 RoboCerebra 子任务描述标注）
-  L_elev      — 语义提升一致性
 
 用法:
   单卡: python pretrain.py --config configs/pretrain.yaml
@@ -148,7 +147,7 @@ def pretrain_step(
     loss_cfg: dict,
 ) -> Dict[str, torch.Tensor]:
     """
-    调用 model(..., mode='pretrain')：仅计算 L_boundary + L_sem + L_elev。
+    调用 model(..., mode='pretrain')：仅计算 L_boundary + L_sem。
     完全不触发 FlowMatching 动作头。
     """
     frames      = batch["frames"].to(device)         # (B, T, 3, H, W)
@@ -164,7 +163,7 @@ def pretrain_step(
         subtask_ids = subtask_ids.to(device)
     instructions: List[str] = batch["instructions"]
 
-    # 预训练 forward：L_boundary + L_sem + L_elev（模型内部完成）
+    # 预训练 forward：L_boundary + L_sem（模型内部完成）
     losses = model(
         images=frames,
         instructions=instructions,
@@ -175,7 +174,6 @@ def pretrain_step(
         mode="pretrain",
         w_boundary=loss_cfg.get("w_boundary", 1.0),
         w_sem=loss_cfg.get("w_sem", 0.5),
-        w_elev=loss_cfg.get("w_elev", 0.2),
         tau_sem=loss_cfg.get("tau_sem", 0.07),
     )
 
@@ -183,7 +181,6 @@ def pretrain_step(
         "loss":       losses.get("total", torch.zeros((), device=device)),
         "L_boundary": losses.get("L_boundary", torch.zeros((), device=device)).detach(),
         "L_sem":      losses.get("L_sem", torch.zeros((), device=device)).detach(),
-        "L_elev":     losses.get("L_elev", torch.zeros((), device=device)).detach(),
     }
 
 

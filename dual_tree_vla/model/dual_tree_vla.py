@@ -11,7 +11,7 @@ DualTreeVLA — 主模型 (CONSTRUCTION.md §2.1)
   JumpAwareHead(A_act_hist, â_1) → p_jump → HMT.insert(z_v_mean, â_1, p_jump>=0.5)
 
 三阶段训练:
-  pretrain  : L_boundary + L_sem + L_elev (pretrain.py 调用)
+    pretrain  : L_boundary + L_sem (pretrain.py 调用)
   phase1    : L_flow only (LLM+预训练模块冻结)
   phase2    : L_flow only (全量微调)
 """
@@ -364,11 +364,10 @@ class DualTreeVLA(nn.Module):
         mode: str = "phase1",
         w_boundary: float = 1.0,
         w_sem: float = 0.5,
-        w_elev: float = 0.2,
         tau_sem: float = 0.07,
     ) -> Dict[str, torch.Tensor]:
         """
-        mode='pretrain' : L_boundary + L_sem + L_elev
+        mode='pretrain' : L_boundary + L_sem
         mode='phase1'   : L_flow only
         mode='phase2'   : L_flow only
         """
@@ -429,7 +428,14 @@ class DualTreeVLA(nn.Module):
                 if compute_jump:
                     jump_logits.append(logit_j)
 
-                force_branch = bool(p_j.detach().item() >= 0.5)
+                # 预训练阶段：优先用 GT subtask_ids 强制分支，保证树结构与标注一致
+                if compute_jump and subtask_ids is not None:
+                    gt_branch = False
+                    if t > 0:
+                        gt_branch = bool(subtask_ids[b, t].item() != subtask_ids[b, t - 1].item())
+                    force_branch = gt_branch
+                else:
+                    force_branch = bool(p_j.detach().item() >= 0.5)
                 # 计算当前帧语义供挂载点搜索（no_grad，仅用于树结构决策）
                 with torch.no_grad():
                     s_current_b = self.mlp_elev(
@@ -460,9 +466,9 @@ class DualTreeVLA(nn.Module):
             L_flow = self._compute_flow_loss(all_Z_fused, actions, device)
             return {"L_flow": L_flow, "total": L_flow}
 
-        # ── Pretrain: boundary + semantic + elevation losses ─────────
+        # ── Pretrain: boundary + semantic losses ─────────────────────
         if compute_jump and jump_logits:
-            from dual_tree_vla.losses.tree_losses import l_boundary, l_sem, l_elev
+            from dual_tree_vla.losses.tree_losses import l_boundary, l_sem
 
             logits_t = torch.cat(jump_logits, dim=0)          # (B*T,)
             y_act    = self._compute_boundary_labels(actions, device)
@@ -495,54 +501,10 @@ class DualTreeVLA(nn.Module):
                     S_text  = torch.stack(s_text_list, dim=0)
                     L_sem = l_sem(S_nodes, S_text, temperature=tau_sem)
 
-            # L_elev: abstract node vs weighted children semantics
-            L_elev = torch.zeros((), device=device)
-            elev_items = []
-            elev_dtype = next(self.mlp_elev.parameters()).dtype
-            for b in range(B):
-                tree_b = self.get_tree(b)
-                for _, node in tree_b.nodes.items():
-                    if node.is_leaf() or node.s is None:
-                        continue
-                    ch_ids = node.children_ids
-                    if len(ch_ids) < 1:
-                        continue
-                    s_ch_list = []
-                    w_ch_list = []
-                    for cid in ch_ids:
-                        child = tree_b.nodes[cid]
-                        w_ch_list.append(child.w)
-                        if child.is_leaf():
-                            z_v_c = child.z_v.to(device=device, dtype=elev_dtype)
-                            with torch.no_grad():
-                                s_proxy = self.mlp_elev(z_v_c.unsqueeze(0)).squeeze(0)
-                            s_ch_list.append(s_proxy)
-                        elif child.s is not None:
-                            s_ch_list.append(child.s.to(device=device, dtype=elev_dtype))
-                    if len(s_ch_list) < 1:
-                        continue
-
-                    leaf_zv = [tree_b.nodes[c].z_v.to(device=device, dtype=elev_dtype)
-                               for c in ch_ids if tree_b.nodes[c].is_leaf()]
-                    if leaf_zv:
-                        lw = [tree_b.nodes[c].w for c in ch_ids if tree_b.nodes[c].is_leaf()]
-                        lw_t = torch.tensor(lw, device=device, dtype=elev_dtype)
-                        lw_t = lw_t / lw_t.sum().clamp(min=1e-6)
-                        z_pool = sum(z * w for z, w in zip(leaf_zv, lw_t))
-                        s_abs = self.mlp_elev(z_pool.unsqueeze(0)).squeeze(0)
-                    else:
-                        s_abs = node.s.to(device=device, dtype=elev_dtype)
-
-                    elev_items.append(l_elev(s_abs, s_ch_list, w_ch_list))
-
-            if elev_items:
-                L_elev = torch.stack(elev_items).mean()
-
-            total = w_boundary * L_bnd + w_sem * L_sem + w_elev * L_elev
+            total = w_boundary * L_bnd + w_sem * L_sem
             return {
                 "L_boundary": L_bnd,
                 "L_sem": L_sem,
-                "L_elev": L_elev,
                 "total": total,
             }
 

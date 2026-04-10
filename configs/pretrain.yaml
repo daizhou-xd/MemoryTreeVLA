@@ -2,7 +2,7 @@
 # ─────────────────────────────────────────────────────────────────────────
 # Stage: Pre-training (动作边界检测 + 语义对齐)
 # Dataset: RoboCerebra
-# Losses: L_boundary (BCE) + L_sem (InfoNCE) + L_elev (MSE)
+# Losses: L_boundary (BCE) + L_sem (InfoNCE)
 #   NOTE: FlowMatching损失 (L_flow) 在预训练阶段不使用。
 # Frozen:    LLM, CrossModalFusion, FlowMatchingActionHead
 # Trainable: SGMTS, sem_proj, JumpAwareHead, MLPElevation, TreeSSM
@@ -64,10 +64,9 @@ train:
   resume_from:   null        # path to checkpoint to resume from
 
 # ── Loss weights ──────────────────────────────────────────────────────────
-# Only these three losses are used in pre-training.
+# Only these two losses are used in pre-training.
 # L_flow / L_recon / L_prog / L_align are Phase-1/2 only — do NOT add them here.
 loss:
   w_boundary:  1.0           # BCE action-mutation boundary detection
   w_sem:       0.5           # InfoNCE branch-point semantic↔sub-task text
-  w_elev:      0.2           # MSE elevation consistency (abstract ↔ children mean)
   tau_sem:     0.07          # InfoNCE temperature
