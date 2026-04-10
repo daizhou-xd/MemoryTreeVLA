@@ -228,10 +228,13 @@ class HierarchicalMemoryTree:
 
         分类规则（d_k = 1 - cos(s_cur, s_k)）：
 
-          Case A 'first'        : d_first >= τ → 第一个抽象节点就满足，直接挂叶子
-          Case B 'intermediate' : d_first < τ 但爬升中某节点 d_k >= τ → 在该节点下
+          跳变发生时 s_cur 与最低抽象节点差异最大，向上爬升差异逐步减小；
+          找到第一个差异足够小（d_k < τ）的祖先节点作为挂载点。
+
+          Case A 'first'        : d_first < τ → 第一个抽象节点差异已足够小，直接挂叶子
+          Case B 'intermediate' : d_first >= τ 但爬升中某节点 d_k < τ → 在该节点下
                                   插入语义探针抽象层，再挂叶子（两层）
-          Case C 'root_exceeded': 爬升至根仍无 d_k >= τ → 语义已超出整棵树，
+          Case C 'root_exceeded': 爬升至根仍无 d_k < τ → 语义已超出整棵树，
                                   创建超级根，将旧根和新叶同挂其下（两层）
 
         Returns
@@ -250,19 +253,21 @@ class HierarchicalMemoryTree:
             return 1.0 - (s_curr * s_n).sum().item()
 
         # 检查第一个抽象节点（最低语义）
+        # 差异小（相似度高）才挂载：跳变时 s_cur 与最低抽象节点差异最大，
+        # 向上爬升差异逐步减小，找到第一个 d_k < τ 的祖先作为挂载点
         d_first = _cos_dist(self._nodes[first_abs_id].s)
-        if d_first is not None and d_first >= self.mount_tau:
+        if d_first is not None and d_first < self.mount_tau:
             return ('first', first_abs_id)
 
-        # 向上爬升
+        # 向上爬升，寻找差异足够小的祖先
         current_id = self._nodes[first_abs_id].parent_id
         while current_id is not None:
             d_k = _cos_dist(self._nodes[current_id].s)
-            if d_k is not None and d_k >= self.mount_tau:
+            if d_k is not None and d_k < self.mount_tau:
                 return ('intermediate', current_id)
             current_id = self._nodes[current_id].parent_id
 
-        # 爬升至根仍未触发 → 语义超出整棵树
+        # 爬升至根差异仍大 → s_cur 语义超出整棵树，需创建超级根
         return ('root_exceeded', self.root_id)
 
     def _branch_split(

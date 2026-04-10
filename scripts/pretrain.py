@@ -154,6 +154,11 @@ def pretrain_step(
     frames      = batch["frames"].to(device)         # (B, T, 3, H, W)
     actions     = batch["actions"].to(device)        # (B, T, d_a)
     states      = batch["states"].to(device)         # (B, T, d_q)
+
+    # 每条轨迹开始前必须重置记忆树，否则节点跨 batch 无限累积导致 OOM
+    B = frames.shape[0]
+    unwrapped = model.module if hasattr(model, "module") else model
+    unwrapped.reset_trees(B)
     subtask_ids = batch.get("subtask_ids")
     if subtask_ids is not None:
         subtask_ids = subtask_ids.to(device)
