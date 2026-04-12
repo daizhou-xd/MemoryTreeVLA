@@ -309,6 +309,7 @@ def train(cfg: dict, phase: int):
 
     # ── Dataset ──────────────────────────────────────────────────────
     dc = cfg["data"]
+    mc = cfg["model"]
     dataset = LiberoDataset(
         root        = dc["root"],
         img_h       = dc.get("img_h", 224),
@@ -332,7 +333,6 @@ def train(cfg: dict, phase: int):
     )
 
     # ── 构建模型 ────────────────────────────────────────────────────
-    mc = cfg["model"]
     model = DualTreeVLA(
         llm_path        = mc["llm_path"],
         clip_model_name = mc.get("clip_model_name"),   # None → PatchCNN fallback
