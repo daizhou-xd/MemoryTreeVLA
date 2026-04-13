@@ -27,11 +27,12 @@ DualTreeVLA 训练脚本 — Phase 1 / Phase 2（参考 Evo-1 train.py 风格）
 from __future__ import annotations
 
 import argparse
+import contextlib
 import math
 import os
 import time
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import numpy as np
 import torch
@@ -59,6 +60,59 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from dual_tree_vla.model import DualTreeVLA
 from dual_tree_vla.dataset import LiberoDataset, libero_collate
+
+
+# ================================================================
+#  EMA（兼容 ZeRO-2/3 参数分片）
+# ================================================================
+
+class ExponentialMovingAverage:
+    """
+    Lightweight EMA of model parameters.
+
+    ZeRO-2/3 compatible: each rank tracks EMA of its own parameter shards
+    (element-wise EMA commutes with partition, so the result is mathematically
+    identical to doing EMA on the full gathered parameters).
+
+    Usage
+    -----
+    ema = ExponentialMovingAverage(raw_model, decay=0.999)
+    # after each optimizer.step():
+    ema.update(raw_model)
+    # to save EMA checkpoint (temporarily swaps params then restores):
+    with ema.scope(raw_model):
+        save_ckpt(model, ...)
+    """
+
+    def __init__(self, model: nn.Module, decay: float = 0.999):
+        self.decay = decay
+        self._shadow: Dict[str, torch.Tensor] = {}
+        with torch.no_grad():
+            for name, p in model.named_parameters():
+                if p.requires_grad:
+                    self._shadow[name] = p.data.clone()
+
+    @torch.no_grad()
+    def update(self, model: nn.Module):
+        d = self.decay
+        for name, p in model.named_parameters():
+            if p.requires_grad and name in self._shadow:
+                self._shadow[name].mul_(d).add_(p.data, alpha=1.0 - d)
+
+    @contextlib.contextmanager
+    def scope(self, model: nn.Module):
+        """Temporarily replace model params with EMA shadow (for eval / saving)."""
+        original: Dict[str, torch.Tensor] = {}
+        for name, p in model.named_parameters():
+            if name in self._shadow:
+                original[name] = p.data.clone()
+                p.data.copy_(self._shadow[name])
+        try:
+            yield
+        finally:
+            for name, p in model.named_parameters():
+                if name in original:
+                    p.data.copy_(original[name])
 
 
 # ================================================================
@@ -169,11 +223,14 @@ def _load_ckpt_partial(model, state_dict):
 #  Checkpoint 保存
 # ================================================================
 
-def save_ckpt(model, optimizer, epoch, step, path: Path, accel=None):
-    if accel is not None and hasattr(accel, "unwrap_model"):
-        state = accel.unwrap_model(model).state_dict()
+def save_ckpt(model, optimizer, epoch, step, path: Path,
+              accel=None, ema: Optional[ExponentialMovingAverage] = None):
+    raw = accel.unwrap_model(model) if (accel is not None and hasattr(accel, "unwrap_model")) else model
+    if ema is not None:
+        with ema.scope(raw):
+            state = raw.state_dict()
     else:
-        state = model.state_dict()
+        state = raw.state_dict()
     torch.save({"model": state, "optimizer": optimizer.state_dict(),
                 "epoch": epoch, "step": step}, path)
     print(f"[train] Saved → {path}", flush=True)
@@ -425,6 +482,15 @@ def train(cfg: dict, phase: int):
 
     model.train()
 
+    # ── EMA（Evo-1 style）────────────────────────────────────────────
+    # Must be created AFTER accel.prepare() so the model is on the correct
+    # device (and sharded for ZeRO-3). EMA shadow tracks param shards, which
+    # is identical to tracking full params because EMA is element-wise.
+    _raw_for_ema = accel.unwrap_model(model) if (accel is not None and _ACCELERATE) else model
+    ema_decay = float(tc.get("ema_decay", 0.999))
+    ema = ExponentialMovingAverage(_raw_for_ema, decay=ema_decay)
+    log_msg(f"{tag} EMA decay={ema_decay}", accel)
+
     # ── W&B ──────────────────────────────────────────────────────────
     project_name = cfg.get("wandb_project", f"DualTreeVLA-phase{phase}")
     if _WANDB and is_main(accel):
@@ -480,6 +546,8 @@ def train(cfg: dict, phase: int):
                         accel.clip_grad_norm_(model.parameters(), 1.0)
                         optimizer.step()
                         optimizer.zero_grad()
+                        # EMA update after every real optimizer step
+                        ema.update(accel.unwrap_model(model))
 
                 # scheduler steps every batch (schedule parameterised per-batch)
                 scheduler.step()
@@ -499,6 +567,7 @@ def train(cfg: dict, phase: int):
                     optimizer.step()
                     scheduler.step()
                     optimizer.zero_grad()
+                    ema.update(model)
                 else:
                     log_msg(f"{tag} step={global_step} loss=NaN/inf, 跳过本批", accel)
 
@@ -523,12 +592,12 @@ def train(cfg: dict, phase: int):
 
         if is_main(accel) and epoch % save_every == 0:
             save_ckpt(model, optimizer, epoch, global_step,
-                      ckpt_dir / f"phase{phase}_ep{epoch:03d}.pt", accel)
+                      ckpt_dir / f"phase{phase}_ep{epoch:03d}.pt", accel, ema)
 
         if is_main(accel) and avg_loss < best_loss:
             best_loss = avg_loss
             save_ckpt(model, optimizer, epoch, global_step,
-                      ckpt_dir / f"phase{phase}_best.pt", accel)
+                      ckpt_dir / f"phase{phase}_best.pt", accel, ema)
 
         # ── 可视化：每 viz_every epoch 保存一次 GT vs 预测对比视频 ──────
         viz_every = tc.get("viz_every", 1)

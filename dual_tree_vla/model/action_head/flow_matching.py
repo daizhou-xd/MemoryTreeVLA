@@ -215,19 +215,26 @@ class FlowMatchingActionHead(nn.Module):
         """
         Conditional flow matching loss — CONSTRUCTION.md Section 5.4.7.
 
-        Time sampling  : τ ~ Beta(2, 2) clipped to [0.02, 0.98]
-        Noise          : ε ~ Uniform[-1, 1]^{H_a × d_a}
-        Interpolation  : a_τ = (1 - τ)·ε + τ·a*
-        Velocity target: v* = a* - ε
-        Loss           : E[‖v_θ(a_τ, τ, C) - v*‖²]
+        Time sampling  : Logit-Normal  u ~ N(0,1), t = σ(u)
+                         Concentrates near t≈0.5 where the velocity magnitude
+                         is ~1. vs. U[0,1]: t≈0 gives ‖v_gt‖≈2, t≈1 gives
+                         ‖v_gt‖≈0.01, which causes catastrophic per-step
+                         loss variance (0.1–0.8) and slow convergence.
+                         (Evo-1 / SD3 / Flux all use this distribution.)
+        Noise          : ε ~ N(0, I)
+        Interpolation  : a_t = (1 - t)·ε + t·a_gt
+        Velocity target: v* = a_gt - ε
+        Loss           : E[‖v_θ(a_t, t, C) - v*‖²]
         """
         B = a_gt.shape[0]
         device = a_gt.device
 
-        # t ~ U[0,1]  (CONSTRUCTION §3.5)
-        t = torch.rand(B, device=device)
+        # Logit-Normal time sampling: u ~ N(0,1), t = sigmoid(u)
+        # This concentrates training on t≈0.5 where signal/noise is balanced.
+        u = torch.randn(B, device=device)
+        t = torch.sigmoid(u)                              # t ∈ (0,1), ≈LogitNormal(0,1)
 
-        # x_0 ~ N(0, I)  (CONSTRUCTION §3.5)
+        # a_0 ~ N(0, I)
         a_noise = torch.randn_like(a_gt)
         t_expand = t.view(B, 1, 1)
 
