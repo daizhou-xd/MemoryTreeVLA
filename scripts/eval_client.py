@@ -166,6 +166,7 @@ async def run(SERVER_URL: str, max_steps: int, num_episodes: int,
                 prompt       = str(task_description)
                 print(prompt)
                 episode_done = False
+                episode_finished = False
                 max_step     = 0
                 frames       = []
 
@@ -203,7 +204,10 @@ async def run(SERVER_URL: str, max_steps: int, num_episodes: int,
                             obs, reward, done, info = env.step(action[:7])
                         except ValueError as ve:
                             print(f"❌ the action is not valid: {ve}")
+                            # Environment has already terminated; stop this episode
+                            # to avoid repeatedly sending actions to a finished env.
                             episode_done = False
+                            episode_finished = True
                             break
 
                         frame = np.ascontiguousarray(obs["agentview_image"][::-1])
@@ -213,12 +217,13 @@ async def run(SERVER_URL: str, max_steps: int, num_episodes: int,
                         if done:
                             print("Task completed")
                             episode_done  = True
+                            episode_finished = True
                             task_success  += 1
                             total_success += 1
                             total_steps   += max_step
                             break
 
-                    if episode_done:
+                    if episode_finished:
                         break
 
                 save_video(
