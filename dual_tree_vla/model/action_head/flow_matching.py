@@ -21,7 +21,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from dual_tree_vla.model.attn import FlashMHA
+from dual_tree_vla.model.common.attn import FlashMHA
 
 
 # ================================================================
@@ -215,26 +215,24 @@ class FlowMatchingActionHead(nn.Module):
         """
         Conditional flow matching loss — CONSTRUCTION.md Section 5.4.7.
 
-        Time sampling  : Logit-Normal  u ~ N(0,1), t = σ(u)
-                         Concentrates near t≈0.5 where the velocity magnitude
-                         is ~1. vs. U[0,1]: t≈0 gives ‖v_gt‖≈2, t≈1 gives
-                         ‖v_gt‖≈0.01, which causes catastrophic per-step
-                         loss variance (0.1–0.8) and slow convergence.
-                         (Evo-1 / SD3 / Flux all use this distribution.)
+        Time sampling  : u ~ N(0, 1), τ = sigmoid(u)  (Logit-Normal)
+                 This concentrates training around τ≈0.5 where
+                 the flow target has balanced signal/noise, reducing
+                 batch-to-batch variance vs Uniform[0,1].
         Noise          : ε ~ N(0, I)
-        Interpolation  : a_t = (1 - t)·ε + t·a_gt
+        Interpolation  : a_τ = (1 - τ)·ε + τ·a_gt
         Velocity target: v* = a_gt - ε
-        Loss           : E[‖v_θ(a_t, t, C) - v*‖²]
+        Loss           : E[‖v_θ(a_τ, τ, C) - v*‖²]
         """
         B = a_gt.shape[0]
         device = a_gt.device
 
-        # Logit-Normal time sampling: u ~ N(0,1), t = sigmoid(u)
-        # This concentrates training on t≈0.5 where signal/noise is balanced.
+        # Evo-style Logit-Normal time sampling: u ~ N(0,1), t = sigmoid(u)
+        # Clamp avoids exact 0/1 in mixed precision.
         u = torch.randn(B, device=device)
-        t = torch.sigmoid(u)                              # t ∈ (0,1), ≈LogitNormal(0,1)
+        t = torch.sigmoid(u).clamp_(1e-4, 1.0 - 1e-4)
 
-        # a_0 ~ N(0, I)
+        # x_0 ~ N(0, I)  (CONSTRUCTION §3.5)
         a_noise = torch.randn_like(a_gt)
         t_expand = t.view(B, 1, 1)
 

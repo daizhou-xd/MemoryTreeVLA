@@ -1,0 +1,72 @@
+﻿# DualTreeVLA Pre-training Configuration (即插即用双树适配器 — Evo-1 骨架)
+# ─────────────────────────────────────────────────────────────────────────
+# Stage: Pre-training（动作边界检测 + 语义对齐 + 语义提升一致性）
+# Dataset: RoboCerebra
+# Losses: L_boundary(BCE) + L_sem(InfoNCE) + L_elev(MSE)
+# Frozen:    Evo-1 骨架全部（ViT, LLM, MLP projector, FlowmatchingHead）
+# Trainable: SGMTS, GateFusion, JumpAwareHead, MLPElevation, TreeSSMReadout,
+#            sem_proj, mem_proj
+# ─────────────────────────────────────────────────────────────────────────
+# Single GPU:
+#   python pretrain.py --config dual_tree_vla/config/pretrain.yaml
+# 8-GPU Accelerate:
+#   accelerate launch --config_file dual_tree_vla/config/deepspeed/... \
+#       pretrain.py --config dual_tree_vla/config/pretrain.yaml
+# ─────────────────────────────────────────────────────────────────────────
+
+mixed_precision: "bf16"
+grad_accum: 1
+seed: 42
+
+wandb_project: "DualTreeVLA-pretrain"
+
+# ── Data ──────────────────────────────────────────────────────────────────
+data:
+  root:        "data/RoboCerebra/RoboCerebra_trainset"
+  scenes:      null          # null = all
+  img_h:       224
+  img_w:       224
+  subsample:   4             # 时间下采样步长（4 ≈ 5 Hz）
+  max_seqlen:  1400          # 下采样后最大帧数（原始 ~5500 帧 ÷ 4 = ~1375，留余量）
+  # feat_cache_dir: "data/RoboCerebra/_feat_cache"   # 离线预提取后在此填写路径，训练提速 10×+
+
+# ── Model（Evo-1 骨架 + 双树适配器参数）─────────────────────────────────────
+model:
+  vlm_path:    "model_weights/InternVL3-1B"   # InternVL3-1B 本地路径（云服务器上请修改为实际绝对路径）
+  d_vit:       896           # InternVL3-1B ViT 隐藏维度
+  d_a:         7             # 动作维度
+  d_q:         7             # 本体感知状态维度
+  d_ssm:       256           # TreeSSMReadout 输出维度
+  d_state:     16            # SSM 状态维度
+  H_a:         16            # 动作 horizon
+  n_ode:       50            # FlowMatching ODE 步数
+  mount_tau:   0.4           # HMT 语义挂载阈值
+  max_tree_depth: 4          # HMT 最大树深度
+  alpha:       0.5           # SGMTS MST 边权语义偏置系数
+  delta_w:     0.1           # HMT 叶节点每次 merge 的权重增量
+
+# ── Training ──────────────────────────────────────────────────────────────
+train:
+  batch_size:    2
+  num_workers:   0
+  epochs:        30
+  lr:            3.0e-4
+  weight_decay:  1.0e-4
+  warmup_ratio:  0.05
+  ckpt_dir:      "data/outputs/pretrain"
+  save_every:    5
+  resume_from:   null
+
+  # ── Eval（嵌入训练循环中，每 eval_every epoch 执行一次）──────────────────
+  eval_every:       999      # 训练时不做 eval，手动用 pretrain_eval.py 评估
+  eval_samples:     50         # eval 样本数（控制时间，不需要全量）
+  eval_heatmap_step: 20        # heatmap 每隔多少帧保存一张（轨迹约 1400 帧，保存约 70 张）
+  result_dir:       "results/pretrain_eval"  # 树 JSON + heatmap 输出根目录
+
+# ── Loss weights ──────────────────────────────────────────────────────────
+# 预训练仅使用以下三个损失（L_flow 在 Phase-1/2 才启用）
+loss:
+  w_boundary:  1.0     # BCE 动作突变边界检测
+  w_sem:       0.5     # InfoNCE 分支点语义 ↔ 子任务文本对齐
+  w_elev:      0.2     # MSE 语义提升一致性（抽象节点 s vs 子节点加权均值）
+  tau_sem:     0.07    # InfoNCE 温度系数

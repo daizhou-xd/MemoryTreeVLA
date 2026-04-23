@@ -391,3 +391,70 @@ class HierarchicalMemoryTree:
         if node.is_leaf():
             return node_id
         return self._find_rightmost_leaf(node.children_ids[-1])
+
+    # ------------------------------------------------------------------ #
+    #  JSON 序列化                                                          #
+    # ------------------------------------------------------------------ #
+
+    def to_json_dict(self) -> dict:
+        """
+        将整棵 HMT 序列化为可 JSON 存储的 dict。
+
+        格式：
+        {
+          "root_id": int | null,
+          "active_id": int | null,
+          "n_nodes": int,
+          "nodes": {
+            "<id>": {
+              "node_id": int,
+              "type": "leaf" | "abstract",
+              "parent_id": int | null,
+              "children_ids": [int, ...],
+              "w": float,
+              "depth": int,
+              "n_actions": int,          # 叶子节点：a_hist 长度
+              "a_mean": [float, ...],    # 叶子节点：动作均值（d_a,）
+              "z_v_norm": float,         # 叶子节点：z_v L2 范数
+              "s_norm": float,           # 抽象节点：s L2 范数
+            }
+          }
+        }
+
+        注意：z_v 和 s 的完整向量不存储（维度过高，仅存摘要统计量），
+              以控制 JSON 文件大小。如需完整向量，请使用 torch.save。
+        """
+        nodes_dict: dict = {}
+        for nid, node in self._nodes.items():
+            d = {
+                "node_id":      node.node_id,
+                "type":         "leaf" if node.is_leaf() else "abstract",
+                "parent_id":    node.parent_id,
+                "children_ids": list(node.children_ids),
+                "w":            float(node.w),
+                "depth":        self.depth(node.node_id),
+            }
+            if node.is_leaf():
+                d["n_actions"] = len(node.a_hist)
+                if node.a_hist:
+                    a_mean = torch.stack(node.a_hist).mean(0)
+                    d["a_mean"] = [round(float(v), 6) for v in a_mean.tolist()]
+                else:
+                    d["a_mean"] = []
+                d["z_v_norm"] = round(float(node.z_v.norm().item()), 6) if node.z_v is not None else 0.0
+                d["s_norm"]   = None
+            else:
+                d["n_actions"] = 0
+                d["a_mean"]   = []
+                d["z_v_norm"] = None
+                d["s_norm"]   = round(float(node.s.norm().item()), 6) if node.s is not None else 0.0
+            nodes_dict[str(nid)] = d
+
+        return {
+            "root_id":   self.root_id,
+            "active_id": self.active_id,
+            "n_nodes":   self.size(),
+            "n_leaves":  sum(1 for n in self._nodes.values() if n.is_leaf()),
+            "n_abstract": sum(1 for n in self._nodes.values() if not n.is_leaf()),
+            "nodes":     nodes_dict,
+        }

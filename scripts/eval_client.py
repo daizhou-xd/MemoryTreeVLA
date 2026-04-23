@@ -1,5 +1,12 @@
 # DualTreeVLA — LIBERO WebSocket Simulation Client
 # Based on Evo-1's libero_client_4tasks.py
+#
+# Current behavior:
+#   - This script does not expose argparse flags yet.
+#   - Edit the Args class below to change server URL, suites, rollout count,
+#     horizon, logging path, and max_steps.
+#   - It sends Evo1-style multi-view JSON to scripts/eval_server.py and
+#     always saves rollout videos under ./video_log_file/<ckpt_name>/.
 
 import asyncio
 import websockets
@@ -68,29 +75,39 @@ def quat2axisangle(quat):
 
 
 # ========= Observation to JSON-compatible dict =========
-def obs_to_json_dict(obs, prompt, img_size=224):
-    # Vertical flip to match lerobot training convention
-    img = np.ascontiguousarray(obs["agentview_image"][::-1])
+def obs_to_json_dict(obs, prompt, img_size=448):
+    img = np.ascontiguousarray(obs["agentview_image"][::-1, ::-1])
+    wrist_img = np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1, ::-1])
     if img.shape[0] != img_size or img.shape[1] != img_size:
         import cv2
         img = cv2.resize(img, (img_size, img_size))
+    if wrist_img.shape[0] != img_size or wrist_img.shape[1] != img_size:
+        import cv2
+        wrist_img = cv2.resize(wrist_img, (img_size, img_size))
+    dummy_proc = np.zeros((img_size, img_size, 3), dtype=np.uint8)
 
     state = np.concatenate((
         obs["robot0_eef_pos"],
         quat2axisangle(obs["robot0_eef_quat"]),
-        obs["robot0_gripper_qpos"][:2],
+        obs["robot0_gripper_qpos"],
     )).tolist()
 
     data = {
-        "image":  encode_image_array(img),
-        "state":  state,
+        "image": [
+            encode_image_array(img),
+            encode_image_array(wrist_img),
+            encode_image_array(dummy_proc),
+        ],
+        "state": state,
         "prompt": prompt,
+        "image_mask": [1, 1, 0],
+        "action_mask": [1] * 7 + [0] * 17,
     }
     return data
 
 
 # ========= Get the environment of LIBERO =========
-def get_libero_env(task, resolution=224, seed=args.SEED):
+def get_libero_env(task, resolution=448, seed=args.SEED):
     task_description = task.language
     task_bddl_file = (
         pathlib.Path(get_libero_path("bddl_files"))
@@ -140,7 +157,7 @@ async def run(SERVER_URL: str, max_steps: int, num_episodes: int,
 
             task           = task_suite.get_task(task_id)
             initial_states = task_suite.get_task_init_states(task_id)
-            env, task_description = get_libero_env(task, resolution=224, seed=args.SEED)
+            env, task_description = get_libero_env(task, resolution=448, seed=args.SEED)
 
             log.info(f"\n========= Start task{task_id + 1}: {task_description} =========")
 
@@ -210,7 +227,10 @@ async def run(SERVER_URL: str, max_steps: int, num_episodes: int,
                             episode_finished = True
                             break
 
-                        frame = np.ascontiguousarray(obs["agentview_image"][::-1])
+                        frame = np.hstack([
+                            np.rot90(obs["agentview_image"], 2),
+                            np.rot90(obs["robot0_eye_in_hand_image"], 2),
+                        ])
                         frames.append(frame)
 
                         print(f"[Step {step}] reward={reward:.2f}, done={done}")

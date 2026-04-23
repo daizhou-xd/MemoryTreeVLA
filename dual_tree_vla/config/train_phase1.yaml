@@ -1,29 +1,35 @@
-﻿# DualTreeVLA Phase 2 Training — Full Fine-tuning
+﻿# DualTreeVLA Phase 1 Training — FlowMatching Warm-up
 # ─────────────────────────────────────────────────────────────────────────
-# Stage: Phase 2 (full fine-tuning, all modules trainable)
-# Dataset: LIBERO (same as Phase 1)
+# Stage: Phase 1 (FlowMatching warm-up, frozen LLM + pre-trained modules)
+# Dataset: LIBERO (LeRobot parquet format)
 # Losses: L_flow ONLY
-#   NOTE: Semantic losses are NOT reintroduced here.
-# Frozen: nothing (LLM trained at 0.1× LR via param groups)
-# Trainable: all modules
-# Init from: checkpoints/runs/phase1/phase1_best.pt
+#   NOTE: Semantic losses (L_boundary, L_sem, L_elev) are NOT used here.
+# Frozen: LLM, SGMTS, sem_proj, JumpAwareHead, MLPElevation, TreeSSM
+# Trainable: CrossModalFusion, FlowMatchingActionHead
+# Init from: checkpoints/runs/pretrain/pretrain_best.pt
 # ─────────────────────────────────────────────────────────────────────────
-# 8-GPU Accelerate + ZeRO-3 (larger model state):
-#   accelerate launch --config_file configs/accelerate_zero3.yaml \
-#       train.py --config configs/train_phase2.yaml --phase 2
+# 8-GPU Accelerate + ZeRO-2:
+#   accelerate launch --config_file configs/accelerate_zero2.yaml \
+#       train.py --config configs/train_phase1.yaml --phase 1
 # ─────────────────────────────────────────────────────────────────────────
 
 mixed_precision: "bf16"
-grad_accum: 4
+grad_accum: 2
 seed: 42
 
-wandb_project: "DualTreeVLA-phase2"
+wandb_project: "DualTreeVLA-phase1"
 
 # ── Data ──────────────────────────────────────────────────────────────────
 data:
-  # Same LIBERO datasets as Phase 1 (LeRobot v2 parquet + video format)
+  # LIBERO datasets (LeRobot v2 parquet + video format)
   # Download: python scripts/download_data.py --libero
-  root:        "dataset/datasets/libero_10"
+  # To train on a single subset, set root to one of:
+  #   data/libero/libero_10        ← LIBERO-LONG (long-horizon, recommended)
+  #   data/libero/libero_spatial
+  #   data/libero/libero_object
+  #   data/libero/libero_goal
+  # To merge all 4 subsets, use roots in train.py (see LiberoDataset docs).
+  root:        "data/libero/libero_10"
   img_h:       224
   img_w:       224
   d_q:         8
@@ -33,8 +39,9 @@ data:
 
 # ── Model ─────────────────────────────────────────────────────────────────
 model:
-  llm_path:    "checkpoints/Qwen2.5-0.5B"  # must match Phase 1 checkpoint (hidden=896)
-  clip_model_name: "checkpoints/CLIP/clip-vit-base-patch16"
+  vlm_path:    "model_weights/InternVL3-1B"    # InternVL3-1B 本地路径（云服务器上请修改为实际绝对路径）
+  clip_model_name: "model_weights/CLIP/clip-vit-base-patch16"
+  pretrain_ckpt: "data/outputs/pretrain/pretrain_best.pt"  # shape不匹配的权重会被自动跳过
   d:           256
   d_a:         7
   d_q:         8
@@ -44,24 +51,25 @@ model:
   patch_size:  16
   H_a:         16
   n_ode:       20
-  theta_fuse:  0.35
+  theta_fuse:  0.35     # tighter after pre-training (embeddings now aligned)
   K_elev:      4
   delta_w:     0.1
   tau:         0.1
 
 # ── Training ──────────────────────────────────────────────────────────────
 train:
-  batch_size:    8       # step-level: each sample is 1 frame
+  batch_size:    8       # step-level: each sample is 1 frame, much lighter than full episodes
   num_workers:   4
-  epochs:        20      # ~374 grad updates/epoch (8GPU×batch8÷grad_accum4), 20ep≈7400 steps
-  lr:            3.0e-5  # lower LR for fine-tuning
+  epochs:        20      # ~748 grad updates/epoch (8GPU×batch8÷grad_accum2), 20ep≈15000 steps
+  lr:            1.0e-4
   weight_decay:  1.0e-4
-  warmup_ratio:  0.03
-  ckpt_dir:      "checkpoints/runs/phase2"
+  warmup_ratio:  0.05
+  ckpt_dir:      "data/outputs/phase1"
   save_every:    1
-  init_from:     "checkpoints/runs/phase1/phase1_best.pt"
+  # Load semantic modules from pre-training
+  init_from: "data/outputs/pretrain/pretrain_best.pt"  # shape不匹配的权重会被自动跳过
 
 # ── Loss weights ──────────────────────────────────────────────────────────
-# Phase 2 uses ONLY L_flow. No semantic losses.
+# Phase 1 uses ONLY L_flow. No semantic losses.
 loss:
   w_flow:   1.0

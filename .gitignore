@@ -1,8 +1,10 @@
 # ── Model checkpoints & downloaded weights ──────────────────────────
 checkpoints/
+model_weights/
 
 # ── Datasets (large, downloaded separately) ──────────────────────────
 dataset/
+data/
 
 # ── Training outputs ─────────────────────────────────────────────────
 outputs/
@@ -40,3 +42,6 @@ Thumbs.db
 # ── IDE ──────────────────────────────────────────────────────────────
 .vscode/
 .idea/
+
+# ── Generated docs/assets ────────────────────────────────────────────
+*.pdf

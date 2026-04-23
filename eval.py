@@ -101,7 +101,7 @@ def parse_args() -> argparse.Namespace:
 
     # Checkpoint & config
     p.add_argument("--ckpt",    required=True,  help="Path to .pt model checkpoint")
-    p.add_argument("--config",  default="configs/default.yaml",
+    p.add_argument("--config",  default="dual_tree_vla/config/default.yaml",
                    help="YAML config used during training")
 
     # Dataset
@@ -112,7 +112,7 @@ def parse_args() -> argparse.Namespace:
                    help="Root directory of the dataset (robocerebra / libero)")
     # RoboCerebraBench-specific arguments
     p.add_argument("--bench_root",
-                   default="dataset/RoboCerebra/RoboCerebraBench",
+                   default="data/RoboCerebra/RoboCerebraBench",
                    help="Root directory of RoboCerebraBench "
                         "(used when --dataset robocerebra_bench)")
     p.add_argument("--task_types", nargs="*", default=None,
@@ -167,39 +167,42 @@ def parse_args() -> argparse.Namespace:
 import sys
 import os
 from pathlib import Path as _P
-sys.path.insert(0, str(_P(__file__).parent.parent))
+sys.path.insert(0, str(_P(__file__).parent))
 
 def load_config(path: str) -> dict:
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 
 def load_model(ckpt_path: str, cfg: dict, device: torch.device):
     """
-    Load DualTreeVLA from checkpoint.
+    Load the in-repo Evo1-backbone + DualTreeAdapter_Evo1 stack from checkpoint.
     Handles plain .pt (state_dict or full training ckpt) and
     DeepSpeed tag-file directory checkpoints.
     """
-    from dual_tree_vla.model import DualTreeVLA
+    from dual_tree_vla.adapter import DualTreeAdapter_Evo1
+    from dual_tree_vla.model.backbone import InternVL3Backbone as EVO1
 
     m_cfg = cfg.get("model", {})
-    model = DualTreeVLA(
-        llm_path        = m_cfg.get("llm_path",        "checkpoints/Qwen2.5-0.5B"),
-        clip_model_name = m_cfg.get("clip_model_name", None),
-        d          = m_cfg.get("d", 256),
-        d_a        = m_cfg.get("d_a", 7),
-        d_q        = m_cfg.get("d_q", 84),
-        d_visual   = m_cfg.get("d_visual", 256),
-        d_ssm      = m_cfg.get("d_ssm", 256),
-        d_state    = m_cfg.get("d_state", 16),
-        patch_size = m_cfg.get("patch_size", 16),
-        H_a        = m_cfg.get("H_a", 16),
-        n_ode      = m_cfg.get("n_ode", 20),
-        theta_fuse = m_cfg.get("theta_fuse", 0.35),
-        K_elev     = m_cfg.get("K_elev", 4),
-        delta_w    = m_cfg.get("delta_w", 0.1),
-        tau        = m_cfg.get("tau", 0.1),
-        freeze_llm = False,   # load full weights regardless
+    backbone = EVO1(config={
+        "vlm_name": m_cfg.get("vlm_path") or m_cfg.get("llm_path"),
+        "device": str(device),
+        "action_horizon": m_cfg.get("H_a", 16),
+        "per_action_dim": m_cfg.get("d_a", 7),
+        "embed_dim": m_cfg.get("d_vit", 896),
+        "state_dim": m_cfg.get("d_q", 84),
+        "num_inference_timesteps": m_cfg.get("n_ode", 20),
+    })
+    model = DualTreeAdapter_Evo1(
+        backbone=backbone,
+        d_vit=m_cfg.get("d_vit", 896),
+        d_a=m_cfg.get("d_a", 7),
+        d_ssm=m_cfg.get("d_ssm", 256),
+        d_state=m_cfg.get("d_state", 16),
+        mount_tau=m_cfg.get("mount_tau", 0.4),
+        max_tree_depth=m_cfg.get("max_tree_depth", 4),
+        alpha=m_cfg.get("alpha", 0.5),
+        delta_w=m_cfg.get("delta_w", 0.1),
     )
 
     ckpt_path = str(ckpt_path)
@@ -248,7 +251,7 @@ def load_model(ckpt_path: str, cfg: dict, device: torch.device):
     for k, v in sd.items():
         if k in model_sd and v.shape != model_sd[k].shape:
             shape_skipped.append(f"{k}: ckpt{list(v.shape)} vs model{list(model_sd[k].shape)}")
-        else:
+        elif k in model_sd:
             sd_clean[k] = v
     if shape_skipped:
         print(f"[WARN] Skipping {len(shape_skipped)} shape-mismatched keys "
@@ -487,11 +490,12 @@ def format_tree(
 @torch.no_grad()
 def evaluate_trajectory(
     model,
-    frames: torch.Tensor,     # (T, 3, H, W)
+    frames: torch.Tensor,     # (T, 3, H, W) or (T, V, 3, H, W)
     actions: torch.Tensor,    # (T, d_a)  — ground-truth actions
     states: torch.Tensor,     # (T, d_q)
     instruction: str,
     device: torch.device,
+    image_mask: Optional[torch.Tensor] = None,
     has_subtask_labels: bool = False,
     subtask_ids: Optional[torch.Tensor] = None,   # (T,) int
     boundary_tol: int = 5,
@@ -499,7 +503,7 @@ def evaluate_trajectory(
     traj_label: str = "",
 ) -> Dict:
     """
-    Run one trajectory through model.step(), collecting per-step metrics.
+    Run one trajectory through model.inference(), collecting per-step metrics.
     Returns a dict of scalar metric values for this trajectory.
     """
     T, d_a = actions.shape
@@ -508,17 +512,15 @@ def evaluate_trajectory(
 
     # Pad proprioception states to the model's expected d_q if necessary
     # (e.g. RoboCerebraBench states are dim-71 while training used dim-84)
-    try:
-        model_dq: int = model.fusion.prop_proj.weight.shape[1]
-    except AttributeError:
-        model_dq = states.shape[-1]
+    backbone_cfg = getattr(model.backbone, "config", {}) if hasattr(model, "backbone") else {}
+    model_dq = backbone_cfg.get("state_dim", states.shape[-1]) if isinstance(backbone_cfg, dict) else states.shape[-1]
     if states.shape[-1] < model_dq:
         pad = torch.zeros(T, model_dq - states.shape[-1], dtype=states.dtype)
         states = torch.cat([states, pad], dim=-1)
     elif states.shape[-1] > model_dq:
         states = states[:, :model_dq]
 
-    model.reset_trees(batch_size=1)
+    model.reset(batch_size=1)
     tree = model.get_tree(0)
     # Attach elevation counter (incremented here, not inside step())
     tree._elevation_count = 0
@@ -552,20 +554,35 @@ def evaluate_trajectory(
     branch_steps: List[int] = []   # timesteps where a real branch was created
     merge_count: int = 0           # timesteps that triggered a merge (no new node)
     dt_values: List[float] = []    # cosine distances between consecutive s embeddings
-    a_prev = None
-
     for t in range(T):
-        img_t = frames[t].unsqueeze(0).to(device)     # (1, 3, H, W)
+        frame_t = frames[t]
+        if frame_t.ndim == 4:
+            image_views = [frame_t[v].to(device) for v in range(frame_t.shape[0])]
+            if image_mask is None:
+                image_mask_t = torch.ones(frame_t.shape[0], dtype=torch.bool, device=device)
+            else:
+                image_mask_t = image_mask.to(device=device, dtype=torch.bool).flatten()
+                if image_mask_t.numel() == 1:
+                    image_mask_t = image_mask_t.repeat(frame_t.shape[0])
+                elif image_mask_t.numel() < frame_t.shape[0]:
+                    padded_mask = torch.zeros(frame_t.shape[0], dtype=torch.bool, device=device)
+                    padded_mask[:image_mask_t.numel()] = image_mask_t
+                    image_mask_t = padded_mask
+                else:
+                    image_mask_t = image_mask_t[:frame_t.shape[0]]
+        else:
+            image_views = [frame_t.to(device)]
+            image_mask_t = torch.ones(1, dtype=torch.bool, device=device)
         q_t   = states[t].unsqueeze(0).to(device)     # (1, d_q)
 
-        # Snapshot active-node s before model.step() calls insert() internally
+        # Snapshot active-node s before inference() updates the tree internally
         _snapshot_s(t)
 
         # Snapshot tree size before step
         size_before = tree.size()
 
         # Predict action chunk (also updates the memory tree internally)
-        a_chunk = model.step(img_t, instruction, q_t, a_prev)   # (1, H_a, d_a)
+        a_chunk = model.inference(image_views, image_mask_t, instruction, q_t)   # (1, H_a, d_a)
 
         # ── Track tree structural changes ──────────────────────────
         size_after = tree.size()
@@ -586,7 +603,7 @@ def evaluate_trajectory(
             branch_steps.append(t)
             if delta >= 2:
                 # semantic_elevation ran and added an abstract parent node too.
-                # model.step() clears elevation_pending_parent after handling,
+                # adapter inference finishes tree update inline,
                 # so we detect it purely via the extra +1 size jump.
                 tree._elevation_count += 1
 
@@ -595,9 +612,6 @@ def evaluate_trajectory(
         a_gt_t       = actions[t]              # (d_a,)
         l1_errors.append((a_pred_first - a_gt_t).abs().mean().item())
         l2_errors.append((a_pred_first - a_gt_t).norm().item())
-
-        # Teacher-force: feed GT action as a_prev
-        a_prev = actions[t].unsqueeze(0).to(device)
 
     # --- Tree stats -------------------------------------------------------
     # Summarise d_t distribution for diagnosing theta_fuse tuning needs.
@@ -685,24 +699,19 @@ def _eval_trajectories(
     all_results: List[Dict] = []
     t0 = time.time()
 
-    # ── Language encoding cache ─────────────────────────────────────────
-    # _encode_language runs the full LLM forward for every step() call.
-    # LIBERO-10 has only 10 unique instructions; cache them to avoid
-    # ~379×128 = 48 K redundant LLM passes.
-    _lang_cache: Dict = {}
-    _orig_encode = model._encode_language.__func__   # unbound method
+    restore_encode = None
+    if hasattr(model, "_encode_task"):
+        _task_cache: Dict[str, torch.Tensor] = {}
+        _orig_encode_task = model._encode_task.__func__
+        import types as _types
 
-    def _cached_encode(self, instructions: List[str], dev: torch.device):
-        key = tuple(instructions)
-        if key not in _lang_cache:
-            result = _orig_encode(self, instructions, dev)
-            _lang_cache[key] = (result[0].detach().cpu(), result[1].detach().cpu())
-        h, g = _lang_cache[key]
-        return h.to(dev), g.to(dev)
+        def _cached_encode_task(self, prompt: str, dev: torch.device):
+            if prompt not in _task_cache:
+                _task_cache[prompt] = _orig_encode_task(self, prompt, dev).detach().cpu()
+            return _task_cache[prompt].to(dev)
 
-    import types as _types
-    model._encode_language = _types.MethodType(_cached_encode, model)
-    # ────────────────────────────────────────────────────────────────────
+        model._encode_task = _types.MethodType(_cached_encode_task, model)
+        restore_encode = ("_encode_task", _orig_encode_task)
 
     for idx in range(n_traj):
         sample = ds[idx]
@@ -711,6 +720,7 @@ def _eval_trajectories(
         actions     = sample["actions"]          # (T, 7)
         states      = sample["states"]           # (T, d_q)
         instruction = sample["instruction"]
+        image_mask  = sample.get("image_mask")
         subtask_ids = sample.get("subtask_ids")  # (T,) or None
 
         if show_task_type:
@@ -728,6 +738,7 @@ def _eval_trajectories(
             states             = states,
             instruction        = instruction,
             device             = device,
+            image_mask         = image_mask,
             has_subtask_labels = has_subtask_labels,
             subtask_ids        = subtask_ids,
             boundary_tol       = boundary_tol,
@@ -757,8 +768,10 @@ def _eval_trajectories(
                 f"({fps:.2f} traj/s)"
             )
 
-    # Restore original _encode_language
-    model._encode_language = _types.MethodType(_orig_encode, model)
+    if restore_encode is not None:
+        import types as _types
+        attr_name, orig_fn = restore_encode
+        setattr(model, attr_name, _types.MethodType(orig_fn, model))
     return all_results
 
 
@@ -882,6 +895,7 @@ def _run_libero_evaluation(
         d_q        = cfg.get("model", {}).get("d_q", 84),
         d_a        = cfg.get("model", {}).get("d_a", 7),
         normalize  = data_cfg.get("normalize", True),
+        step_level = False,
     )
 
     n_traj = len(ds)
@@ -975,11 +989,14 @@ def run_evaluation(args: argparse.Namespace):
     print(f"Loading model from {args.ckpt} ...")
     model = load_model(args.ckpt, cfg, device)
 
-    # ── Override tree theta_fuse if requested ────────────────────────
+    # ── Legacy theta_fuse override (not used by adapter route) ───────
     if args.theta_fuse is not None:
-        old_theta = model._tree_cfg.get("theta_fuse", "?")
-        model._tree_cfg["theta_fuse"] = args.theta_fuse
-        print(f"[INFO] theta_fuse overridden: {old_theta} → {args.theta_fuse}")
+        if hasattr(model, "_tree_cfg"):
+            old_theta = model._tree_cfg.get("theta_fuse", "?")
+            model._tree_cfg["theta_fuse"] = args.theta_fuse
+            print(f"[INFO] theta_fuse overridden: {old_theta} → {args.theta_fuse}")
+        else:
+            print("[INFO] --theta_fuse ignored: current offline eval uses the Evo1-backbone + adapter route, not the legacy policy path.")
 
     # ── Dispatch per dataset mode ────────────────────────────────────
     if args.dataset == "robocerebra_bench":

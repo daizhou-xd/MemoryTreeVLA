@@ -1,3 +1,3 @@
-from .flow_matching import FlowMatchingActionHead
+from .jump_aware_head import JumpAwareHead
 
-__all__ = ["FlowMatchingActionHead"]
+__all__ = ["JumpAwareHead"]

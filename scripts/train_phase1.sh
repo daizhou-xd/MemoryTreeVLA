@@ -10,7 +10,7 @@
 set -e
 
 NUM_GPUS=${1:-8}
-CONFIG=configs/train_phase1.yaml
+CONFIG=dual_tree_vla/config/train_phase1.yaml
 
 echo "[train_phase1.sh] GPUs=$NUM_GPUS  config=$CONFIG"
 
@@ -26,6 +26,6 @@ accelerate launch \
     --num_processes $NUM_GPUS \
     --mixed_precision bf16 \
     --dynamo_backend no \
-    scripts/train.py \
+    train.py \
         --config "$CONFIG" \
         --phase 1

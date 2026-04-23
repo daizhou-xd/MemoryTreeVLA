@@ -39,6 +39,12 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 import yaml
 
+try:
+    from tqdm.auto import tqdm
+    _TQDM = True
+except ImportError:
+    _TQDM = False
+
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 try:
@@ -55,10 +61,17 @@ except ImportError:
     _WANDB = False
 
 import sys
-sys.path.insert(0, str(Path(__file__).parent.parent))
+_project_root = Path(__file__).parent
+sys.path.insert(0, str(_project_root))
 
-from dual_tree_vla.model import DualTreeVLA
+# ── 主干网络（自包含，无外部 Evo-1 依赖）────────────────────────────
+from dual_tree_vla.model.backbone import InternVL3Backbone as EVO1
+
+from dual_tree_vla.adapter import DualTreeAdapter_Evo1
 from dual_tree_vla.dataset import LiberoDataset, libero_collate
+
+# 旧名兼容（部分工具函数签名中保留 model 类型提示）
+DualTreeVLA = DualTreeAdapter_Evo1
 
 
 # ================================================================
@@ -94,17 +107,19 @@ def get_lr_lambda(warmup_steps: int, total_steps: int, resume_step: int = 0):
     return lr_lambda
 
 
-def inspect_named_modules(model: DualTreeVLA, accel=None):
+def inspect_named_modules(model: DualTreeAdapter_Evo1, accel=None):
     """打印各模块参数统计（直接对标 Evo-1 inspect_named_submodules）。"""
+    embedder = model.backbone.embedder
     groups = {
-        "LLM backbone":     model.llm,
-        "SGMTS":            model.sgmts,
-        "sem_proj":         model.sem_proj,
-        "JumpAwareHead":    model.jump_head,
-        "TreeSSMReadout":   model.tree_ssm,
-        "MLPElevation":     model.mlp_elev,
-        "CrossModalFusion": model.fusion,
-        "FlowMatchingHead": model.action_head,
+        "VLM (ViT+LLM)": embedder.model,
+        "SGMTS":          model.sgmts,
+        "GateFusion":     model.gate_fuse,
+        "sem_proj":       model.sem_proj,
+        "JumpAwareHead":  model.jump_head,
+        "TreeSSMReadout": model.tree_ssm,
+        "MLPElevation":   model.mlp_elev,
+        "mem_proj":       model.mem_proj,
+        "ActionHead":     model.backbone.action_head,
     }
     log_msg("\n── 参数统计 ──────────────────────────────────────────", accel)
     total_all, train_all = 0, 0
@@ -122,41 +137,44 @@ def inspect_named_modules(model: DualTreeVLA, accel=None):
 #  冻结策略
 # ================================================================
 
-def freeze_phase1(model: DualTreeVLA):
+def freeze_phase1(model: DualTreeAdapter_Evo1):
     """
-    Phase 1：冻结 LLM + 全部预训练模块，只训 CrossModalFusion + FlowMatchingHead。
+    Phase 1: 骨架全冻结，只训练 L_flow 梯度路径上的可训练模块。
+    L_flow 路径: backbone.action_head + _embed_with_dual_tree 里的
+              SGMTS / GateFusion / mem_proj
+
+    冻结（不参与 L_flow）: LLM, ViT, jump_head, tree_ssm, mlp_elev, sem_proj
+    可训练: SGMTS, GateFusion, mem_proj, backbone.action_head
     """
+    # 先全冻结
     for p in model.parameters():
         p.requires_grad = False
-
-    for m in [model.fusion, model.action_head]:
+    # 只开放 L_flow 路径上的模块
+    for m in [model.sgmts, model.gate_fuse, model.mem_proj,
+              model.backbone.action_head]:
         for p in m.parameters():
             p.requires_grad = True
-
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
     n_total = sum(p.numel() for p in model.parameters())
     return n_train, n_total
 
 
-def unfreeze_phase2(model: DualTreeVLA):
+def unfreeze_phase2(model: DualTreeAdapter_Evo1):
     """
-    Phase 2：在 Phase 1 基础上，仅额外解冻 LLM + 视觉骨干(SGMTS)。
-    记忆树相关模块保持冻结：jump_head / tree_ssm / mlp_elev / sem_proj。
+    Phase 2：骨架 LLM 以 0.1× LR 解冻；ViT/MLP projector 继续冻结。
     """
-    # Start from fully frozen, then enable selected modules.
+    # 先冻结全部
     for p in model.parameters():
         p.requires_grad = False
-
-    # Keep Phase-1 trainables
-    for m in [model.fusion, model.action_head]:
+    # 双树模块解冻
+    for m in [model.sgmts, model.gate_fuse, model.jump_head,
+              model.tree_ssm, model.mlp_elev, model.mem_proj, model.sem_proj]:
         for p in m.parameters():
             p.requires_grad = True
-
-    # Additional unfreeze for Phase-2
-    for m in [model.llm, model.sgmts]:
-        for p in m.parameters():
-            p.requires_grad = True
-
+    # 骨架 LLM 解冻（0.1× LR 在 optimizer param_groups 里设置）
+    llm = model.backbone.embedder.model.language_model
+    for p in llm.parameters():
+        p.requires_grad = True
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
     n_total = sum(p.numel() for p in model.parameters())
     return n_train, n_total
@@ -224,19 +242,23 @@ def visualize_epoch(
         log_msg(f"[viz] dataset[{episode_idx}] failed: {e}", accel)
         return
 
-    frames_t   = sample["frames"]       # (T, 3, H, W) float32 [0,1]
+    frames_t   = sample["frames"]       # (T, V, 3, H, W) or (T, 3, H, W)
     actions_gt = sample["actions"]      # (T, d_a)  — normalized
     states_t   = sample["states"]       # (T, d_q)  — normalized
+    image_mask = sample.get("image_mask")
     instr      = sample["instruction"]  # str
 
     T = min(int(frames_t.shape[0]), max_frames)
-    _, C, H, W = frames_t.shape
+    if frames_t.ndim == 5:
+        _, _, C, H, W = frames_t.shape
+    else:
+        _, C, H, W = frames_t.shape
     PANEL = 95   # pixel height of the text panel appended below the image
 
     # Unwrap DDP / ZeRO wrapper and switch to eval
     raw = accel.unwrap_model(model) if (accel is not None and hasattr(accel, "unwrap_model")) else model
     raw.eval()
-    raw.reset_trees(batch_size=1)
+    raw.reset(batch_size=1)
 
     os.makedirs(viz_dir, exist_ok=True)
     out_path = os.path.join(viz_dir, f"phase{phase}_ep{epoch:03d}.mp4")
@@ -252,9 +274,14 @@ def visualize_epoch(
 
     with torch.no_grad():
         for t in range(T):
-            img_t   = frames_t[t].unsqueeze(0).to(device)   # (1,3,H,W)
+            if frames_t.ndim == 5:
+                views_t = [frames_t[t, v].to(device) for v in range(frames_t.shape[1])]
+                image_mask_t = image_mask if image_mask is not None else torch.ones(frames_t.shape[1], dtype=torch.bool)
+            else:
+                views_t = [frames_t[t].to(device)]
+                image_mask_t = torch.ones(1, dtype=torch.bool)
             state_t = states_t[t].unsqueeze(0).to(device)   # (1,d_q)
-            a_chunk = raw.step(img_t, instr, state_t, a_prev)  # (1,H_a,d_a)
+            a_chunk = raw.inference(views_t, image_mask_t.to(device), instr, state_t)  # (1,H_a,d_a)
             pred    = a_chunk[0, 0].cpu().float().numpy()       # (d_a,)
             a_prev  = a_chunk[0, -1].unsqueeze(0)
 
@@ -266,7 +293,12 @@ def visualize_epoch(
             all_mae.append(mae)
 
             # RGB → BGR for cv2
-            frame_rgb = (frames_t[t].permute(1, 2, 0).numpy() * 255).clip(0, 255).astype(np.uint8)
+            frame_vis = frames_t[t]
+            if frame_vis.ndim == 4:
+                active_views = torch.where(image_mask_t.cpu())[0]
+                vis_idx = int(active_views[0]) if len(active_views) > 0 else 0
+                frame_vis = frame_vis[vis_idx]
+            frame_rgb = (frame_vis.permute(1, 2, 0).numpy() * 255).clip(0, 255).astype(np.uint8)
             frame_bgr = _cv2.cvtColor(frame_rgb, _cv2.COLOR_RGB2BGR)
 
             # Text panel
@@ -301,9 +333,9 @@ def train(cfg: dict, phase: int):
 
     # ── Accelerator ─────────────────────────────────────────────────
     if _ACCELERATE:
-        # Phase 2 unfreezes all params but jump_head/sem_proj/mlp_elev don't
-        # participate in L_flow gradient path → must allow unused parameters.
-        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=(phase == 2))
+        # find_unused_parameters=False: Phase1/2 冻结模块已排除在 autograd 图外，
+        # 不存在真正的 unused parameters（DDP warning 亦已确认），无需额外图遍历。
+        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
         accel = Accelerator(
             mixed_precision=cfg.get("mixed_precision", "bf16"),
             gradient_accumulation_steps=cfg.get("grad_accum", 1),
@@ -348,24 +380,30 @@ def train(cfg: dict, phase: int):
         drop_last   = True,
     )
 
-    # ── 构建模型 ────────────────────────────────────────────────────
-    model = DualTreeVLA(
-        llm_path        = mc["llm_path"],
-        clip_model_name = mc.get("clip_model_name"),   # None → PatchCNN fallback
-        d          = mc.get("d", 256),
-        d_a        = mc.get("d_a", 7),
-        d_q        = mc.get("d_q", 8),
-        d_visual   = mc.get("d_visual", 256),
-        d_ssm      = mc.get("d_ssm", 256),
-        d_state    = mc.get("d_state", 16),
-        patch_size = mc.get("patch_size", 16),
-        H_a        = mc.get("H_a", 16),
-        n_ode      = mc.get("n_ode", 20),
-        theta_fuse = mc.get("theta_fuse", 0.35),
-        K_elev     = mc.get("K_elev", 4),
-        delta_w    = mc.get("delta_w", 0.1),
-        tau        = mc.get("tau", 0.1),
-        freeze_llm = (phase == 1),
+    # ── 构建模型 ─────────────────────────────────────────────────────
+    assert EVO1 is not None, "InternVL3Backbone 未能导入，请检查 dual_tree_vla 包是否正确安装。"
+    _vlm_path = mc.get("vlm_path") or mc.get("llm_path")
+    if not _vlm_path:
+        raise ValueError("config[model] 必须含 'vlm_path' 键，指向 InternVL3 模型目录。")
+    backbone = EVO1(config={
+        "vlm_name":           _vlm_path,
+        "device":             str(device),
+        "action_horizon":     mc.get("H_a", 16),
+        "per_action_dim":     mc.get("d_a", 7),
+        "embed_dim":          mc.get("d_vit", 896),
+        "state_dim":          mc.get("d_q", 7),
+        "num_inference_timesteps": mc.get("n_ode", 50),
+    })
+    model = DualTreeAdapter_Evo1(
+        backbone       = backbone,
+        d_vit          = mc.get("d_vit", 896),
+        d_a            = mc.get("d_a", 7),
+        d_ssm          = mc.get("d_ssm", 256),
+        d_state        = mc.get("d_state", 16),
+        mount_tau      = mc.get("mount_tau", 0.4),
+        max_tree_depth = mc.get("max_tree_depth", 4),
+        alpha          = mc.get("alpha", 0.5),
+        delta_w        = mc.get("delta_w", 0.1),
     )
 
     # 从预训练 / Phase1 ckpt 初始化
@@ -400,14 +438,16 @@ def train(cfg: dict, phase: int):
     lr = float(tc.get("lr", 1e-4 if phase == 1 else 3e-5))
     wd = float(tc.get("weight_decay", 1e-4))
 
-    # Phase 2：LLM 使用更低 LR
+    # Phase 2：骨架 LLM 使用 0.1× 学习率
     if phase == 2:
-        llm_params    = [p for p in model.llm.parameters()  if p.requires_grad]
-        other_params  = [p for name, p in model.named_parameters()
-                         if p.requires_grad and not name.startswith("llm.")]
-        param_groups  = [
+        llm_params   = [p for name, p in model.named_parameters()
+                        if p.requires_grad and "backbone.embedder.model.language_model" in name]
+        other_params = [p for name, p in model.named_parameters()
+                        if p.requires_grad and "backbone.embedder.model.language_model" not in name]
+        param_groups = [
             {"params": other_params, "lr": lr,       "weight_decay": wd},
-            {"params": llm_params,   "lr": lr * 0.1, "weight_decay": wd},
+            {"params": llm_params,   "lr": lr * 0.1, "weight_decay": wd,
+             "is_backbone_llm": True, "base_lr": lr},
         ]
     else:
         decay_p, no_decay_p = [], []
@@ -458,36 +498,35 @@ def train(cfg: dict, phase: int):
 
     for epoch in range(1, tc["epochs"] + 1):
         epoch_loss_sum = 0.0
+        epoch_iter = loader
+        if is_main(accel) and _TQDM:
+            epoch_iter = tqdm(
+                loader,
+                desc=f"{tag} Epoch {epoch}/{tc['epochs']}",
+                leave=False,
+                dynamic_ncols=True,
+            )
 
-        for batch in loader:
+        for batch in epoch_iter:
             if not _ACCELERATE:
                 batch = {k: (v.to(device) if isinstance(v, torch.Tensor) else v)
                          for k, v in batch.items()}
 
-            frames  = batch["frames"].to(device)          # (B, T, C, H, W)
+            frames  = batch["frames"].to(device)          # (B, T, V, C, H, W) or legacy shapes
             actions = batch["actions"].to(device)         # (B, T, d_a)
-            states  = batch["states"].to(device)          # (B, T, d_q)
-            episode_ids = batch.get("episode_ids", None)
-            frame_indices = batch.get("frame_indices", None)
-            if isinstance(episode_ids, torch.Tensor):
-                episode_ids = episode_ids.to(device)
-            if isinstance(frame_indices, torch.Tensor):
-                frame_indices = frame_indices.to(device)
+            states  = batch["states"].to(device)          # (B, d_q)
+            image_masks = batch.get("image_masks")
             instructions: List[str] = batch["instructions"]
 
             # ── 前向 + 损失（仅 L_flow）────────────────────────────
-            # IMPORTANT: accel.accumulate() is required for gradient accumulation
-            # to actually work. Without it, optimizer.step() runs every batch
-            # instead of every grad_accum batches.
             if _ACCELERATE and accel is not None:
                 with accel.accumulate(model):
                     losses = model(
                         images=frames,
+                        image_mask=image_masks,
                         instructions=instructions,
                         states=states,
                         actions=actions,
-                        episode_ids=episode_ids,
-                        frame_indices=frame_indices,
                         mode=mode_str,
                     )
                     loss = losses["total"]
@@ -497,22 +536,18 @@ def train(cfg: dict, phase: int):
                     else:
                         log_msg(f"{tag} step={global_step} loss=NaN/inf, skipping backward", accel)
 
-                    # clip + step only when gradients are actually synced
                     if accel.sync_gradients:
                         accel.clip_grad_norm_(model.parameters(), 1.0)
                         optimizer.step()
                         optimizer.zero_grad()
-
-                # scheduler steps every batch (schedule parameterised per-batch)
-                scheduler.step()
+                        scheduler.step()
             else:
                 losses = model(
                     images=frames,
+                    image_mask=image_masks,
                     instructions=instructions,
                     states=states,
                     actions=actions,
-                    episode_ids=episode_ids,
-                    frame_indices=frame_indices,
                     mode=mode_str,
                 )
                 loss = losses["total"]
@@ -529,21 +564,13 @@ def train(cfg: dict, phase: int):
             global_step += 1
             if torch.isfinite(loss):
                 epoch_loss_sum += loss.item()
-
-            if global_step % 50 == 0 and is_main(accel):
-                lr_now = scheduler.get_last_lr()[0]
-                loss_val = loss.item() if torch.isfinite(loss) else float("nan")
-                log_msg(
-                    f"{tag} ep={epoch}/{tc['epochs']}  step={global_step}"
-                    f"  L_flow={loss_val:.4f}  lr={lr_now:.2e}",
-                    accel,
-                )
-                if _WANDB:
-                    wandb.log({"train/L_flow": loss_val, "lr": lr_now},
-                              step=global_step)
+            # Progress display is handled by tqdm bar itself (no per-step prints).
 
         avg_loss = epoch_loss_sum / max(len(loader), 1)
         log_msg(f"{tag} Epoch {epoch}/{tc['epochs']}  avg_L_flow={avg_loss:.4f}", accel)
+        if _WANDB and is_main(accel):
+            wandb.log({"train/avg_L_flow": avg_loss, "lr": scheduler.get_last_lr()[0]},
+                      step=global_step)
 
         if is_main(accel) and epoch % save_every == 0:
             save_ckpt(model, optimizer, epoch, global_step,
@@ -555,7 +582,7 @@ def train(cfg: dict, phase: int):
                       ckpt_dir / f"phase{phase}_best.pt", accel)
 
         # ── 可视化：每 viz_every epoch 保存一次 GT vs 预测对比视频 ──────
-        viz_every = tc.get("viz_every", 1)
+        viz_every = tc.get("viz_every", 5)   # 默认每 5 epoch 可视化一次（原 1 太频繁）
         viz_dir   = str(tc.get("viz_dir", "results/viz"))
         if viz_every > 0 and epoch % viz_every == 0 and is_main(accel):
             visualize_epoch(

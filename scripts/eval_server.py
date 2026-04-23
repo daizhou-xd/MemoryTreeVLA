@@ -2,8 +2,8 @@
 # Based on Evo-1's Evo1_server.py
 #
 # Usage:
-#   python scripts/eval_server.py
-#   (edit ckpt_dir / config_path / port below)
+#   python scripts/eval_server.py --ckpt <checkpoint.pt> --config dual_tree_vla/config/train_phase2.yaml --port 9000
+#   This script only starts the WebSocket inference service. LIBERO rollout is driven by scripts/eval_client.py.
 
 import sys
 import os
@@ -18,7 +18,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from dual_tree_vla.model import DualTreeVLA
+from dual_tree_vla.adapter import DualTreeAdapter_Evo1
+from dual_tree_vla.model.backbone import InternVL3Backbone
 
 
 # ========= Normalizer (z-score, matches LiberoDataset) =========
@@ -58,51 +59,53 @@ class Normalizer:
         return out
 
 
+def _load_ckpt_partial(model, state_dict):
+    model_sd = model.state_dict()
+    compatible = {k: v for k, v in state_dict.items() if k in model_sd and v.shape == model_sd[k].shape}
+    skipped = [k for k, v in state_dict.items() if k in model_sd and v.shape != model_sd[k].shape]
+    missing, unexpected = model.load_state_dict(compatible, strict=False)
+    return missing, unexpected, skipped
+
+
 # ========= Model loading =========
 def load_model_and_normalizer(ckpt_path, config_path, stats_override=None):
     with open(config_path) as f:
         cfg = yaml.safe_load(f)
 
     m = cfg.get("model", {})
-    model = DualTreeVLA(
-        llm_path        = m.get("llm_path",        "checkpoints/Qwen2.5-0.5B"),
-        clip_model_name = m.get("clip_model_name", None),
-        d           = m.get("d",           256),
-        d_a         = m.get("d_a",         7),
-        d_q         = m.get("d_q",         8),
-        d_visual    = m.get("d_visual",    256),
-        d_ssm       = m.get("d_ssm",       256),
-        d_state     = m.get("d_state",     16),
-        patch_size  = m.get("patch_size",  16),
-        H_a         = m.get("H_a",         16),
-        n_ode       = m.get("n_ode",       20),
-        theta_fuse  = m.get("theta_fuse",  0.35),
-        K_elev      = m.get("K_elev",      4),
-        delta_w     = m.get("delta_w",     0.1),
-        tau         = m.get("tau",         0.1),
-        freeze_llm  = False,
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    backbone = InternVL3Backbone(config={
+        "vlm_name": m.get("vlm_path") or m.get("llm_path"),
+        "device": device,
+        "action_horizon": m.get("H_a", 16),
+        "per_action_dim": m.get("d_a", 7),
+        "embed_dim": m.get("d_vit", 896),
+        "state_dim": m.get("d_q", 8),
+        "num_inference_timesteps": m.get("n_ode", 20),
+    })
+    model = DualTreeAdapter_Evo1(
+        backbone=backbone,
+        d_vit=m.get("d_vit", 896),
+        d_a=m.get("d_a", 7),
+        d_ssm=m.get("d_ssm", 256),
+        d_state=m.get("d_state", 16),
+        mount_tau=m.get("mount_tau", 0.4),
+        max_tree_depth=m.get("max_tree_depth", 4),
+        alpha=m.get("alpha", 0.5),
+        delta_w=m.get("delta_w", 0.1),
     ).eval()
 
     ckpt = torch.load(ckpt_path, map_location="cpu")
-    sd = (
-        ckpt.get("model")
-        or ckpt.get("model_state_dict")
-        or ckpt.get("module")
-        or ckpt
-    )
-    model_sd = model.state_dict()
-    sd_clean = {k: v for k, v in sd.items()
-                if k in model_sd and v.shape == model_sd[k].shape}
-    skipped = len(sd) - len(sd_clean)
+    sd = ckpt.get("model") or ckpt.get("model_state_dict") or ckpt.get("module") or ckpt
+    missing, unexpected, skipped = _load_ckpt_partial(model, sd)
     if skipped:
-        print(f"⚠️  Skipped {skipped} shape-mismatched checkpoint keys")
-    missing, unexpected = model.load_state_dict(sd_clean, strict=False)
+        print(f"⚠️  Skipped {len(skipped)} shape-mismatched checkpoint keys")
     if missing:
         print(f"⚠️  Missing  ({len(missing)}): {missing[:4]}")
     if unexpected:
         print(f"⚠️  Unexpected ({len(unexpected)}): {unexpected[:4]}")
 
-    model = model.to("cuda")
+    model = model.to(device)
 
     # Resolve stats.json path
     if stats_override and os.path.isfile(stats_override):
@@ -122,44 +125,37 @@ def load_model_and_normalizer(ckpt_path, config_path, stats_override=None):
 
     normalizer = Normalizer(stats_path)
     d_q = m.get("d_q", 8)
-    return model, normalizer, d_q
-
-
-# ========= Language cache (avoid repeated LLM forward) =========
-def patch_lang_cache(model):
-    import types
-    _cache: dict = {}
-    _orig = model._encode_language.__func__
-
-    def _cached(self, instructions, dev):
-        key = tuple(instructions)
-        if key not in _cache:
-            with torch.no_grad():
-                h, g = _orig(self, instructions, dev)
-            _cache[key] = (h.detach().cpu(), g.detach().cpu())
-        h, g = _cache[key]
-        return h.to(dev), g.to(dev)
-
-    model._encode_language = types.MethodType(_cached, model)
+    d_a = m.get("d_a", 7)
+    image_size = getattr(model.backbone.embedder, "image_size", 448)
+    return model, normalizer, d_q, d_a, image_size
 
 
 # ========= Decode image from JSON list =========
-def decode_image_from_list(img_list, img_size=224):
+def decode_image_from_list(img_list, img_size=448):
     img_array = np.array(img_list, dtype=np.uint8)   # (H, W, 3) RGB
     if img_array.shape[0] != img_size or img_array.shape[1] != img_size:
         img_array = cv2.resize(img_array, (img_size, img_size))
-    img_t = (
-        torch.from_numpy(img_array.astype(np.float32) / 255.0)
-        .permute(2, 0, 1)
-        .unsqueeze(0)
-        .to("cuda")
-    )   # (1, 3, H, W)
-    return img_t
+    return torch.from_numpy(img_array.astype(np.float32) / 255.0).permute(2, 0, 1)
+
+
+def _normalize_image_payload(image_payload):
+    if not isinstance(image_payload, list) or not image_payload:
+        raise ValueError("JSON field 'image' must be a non-empty list.")
+    first = image_payload[0]
+    if isinstance(first, list) and first and isinstance(first[0], list) and first[0] and isinstance(first[0][0], list):
+        return image_payload
+    return [image_payload]
 
 
 # ========= Inference from JSON dict =========
-def infer_from_json_dict(data: dict, model, normalizer, d_q: int):
-    img_t   = decode_image_from_list(data["image"])
+def infer_from_json_dict(data: dict, model, normalizer, d_q: int, d_a: int, image_size: int):
+    image_views = _normalize_image_payload(data["image"])
+    images = [decode_image_from_list(view, img_size=image_size).to(next(model.parameters()).device) for view in image_views]
+    image_mask = torch.as_tensor(
+        data.get("image_mask", [1] * len(images)),
+        dtype=torch.bool,
+        device=next(model.parameters()).device,
+    )
 
     state_raw = np.array(data["state"], dtype=np.float32)
     if len(state_raw) < d_q:
@@ -167,12 +163,21 @@ def infer_from_json_dict(data: dict, model, normalizer, d_q: int):
     else:
         state_raw = state_raw[:d_q]
     state_norm = normalizer.normalize_state(state_raw)
-    state_t = torch.from_numpy(state_norm).unsqueeze(0).to("cuda")   # (1, d_q)
+    state_t = torch.from_numpy(state_norm).unsqueeze(0).to(next(model.parameters()).device)   # (1, d_q)
+
+    action_mask_t = None
+    if "action_mask" in data and data["action_mask"] is not None:
+        action_mask = np.array(data["action_mask"], dtype=np.float32)
+        if action_mask.shape[0] < d_a:
+            action_mask = np.pad(action_mask, (0, d_a - action_mask.shape[0]), constant_values=1.0)
+        else:
+            action_mask = action_mask[:d_a]
+        action_mask_t = torch.from_numpy(action_mask).unsqueeze(0).to(next(model.parameters()).device)
 
     prompt = data["prompt"]
 
     with torch.no_grad():
-        a_chunk = model.step(img_t, prompt, state_t)   # (1, H_a, d_a)
+        a_chunk = model.inference(images, image_mask, prompt, state_t, action_mask=action_mask_t)
     a_np = a_chunk[0].cpu().float().numpy()            # (H_a, d_a)
 
     # Debug: print raw z-score vs denormalized action for first slot
@@ -189,7 +194,7 @@ def infer_from_json_dict(data: dict, model, normalizer, d_q: int):
 
 
 # ========= WebSocket handler =========
-async def handle_request(websocket, model, normalizer, d_q):
+async def handle_request(websocket, model, normalizer, d_q, d_a, image_size):
     print("Client connected")
     try:
         async for message in websocket:
@@ -204,7 +209,7 @@ async def handle_request(websocket, model, normalizer, d_q):
 
             # Inference
             print("Received observation")
-            actions = infer_from_json_dict(json_data, model, normalizer, d_q)
+            actions = infer_from_json_dict(json_data, model, normalizer, d_q, d_a, image_size)
             await websocket.send(json.dumps(actions))
             print("Sent action chunk")
 
@@ -218,8 +223,8 @@ async def handle_request(websocket, model, normalizer, d_q):
 if __name__ == "__main__":
     import argparse
     p = argparse.ArgumentParser()
-    p.add_argument("--ckpt",   default="checkpoints/runs/phase2/phase2_best.pt")
-    p.add_argument("--config", default="configs/train_phase2.yaml")
+    p.add_argument("--ckpt",   default="data/outputs/phase2/phase2_best.pt")
+    p.add_argument("--config", default="dual_tree_vla/config/train_phase2.yaml")
     p.add_argument("--stats",  default=None,
                    help="Path to stats.json.  If omitted, auto-detected from config's data.root.")
     p.add_argument("--port",   type=int, default=9000)
@@ -228,14 +233,13 @@ if __name__ == "__main__":
 
     port = args.port
 
-    print("Loading DualTreeVLA model...")
-    model, normalizer, d_q = load_model_and_normalizer(args.ckpt, args.config, args.stats)
-    patch_lang_cache(model)
+    print("Loading DualTreeVLA Evo1-adapter model...")
+    model, normalizer, d_q, d_a, image_size = load_model_and_normalizer(args.ckpt, args.config, args.stats)
 
     async def main():
         print(f"DualTreeVLA server running at ws://{args.host}:{port}")
         async with websockets.serve(
-            lambda ws: handle_request(ws, model, normalizer, d_q),
+            lambda ws: handle_request(ws, model, normalizer, d_q, d_a, image_size),
             args.host, port, max_size=100_000_000
         ):
             await asyncio.Future()

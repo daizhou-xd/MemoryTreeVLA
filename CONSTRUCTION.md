@@ -1,744 +1,1643 @@
-﻿# DualTreeVLA — 架构与设计文档
+# DualTreeVLA — 架构、实现与实验工作流全说明
 
-> **「双树」命名由来**：DualTreeVLA 同时运行两棵树——
-> - **视觉树**（Visual Tree）：SGMTS 每帧在 patch 特征图上动态构建语义加权最大生成树，沿 BFS 序进行 Mamba 扫描，目标是 **< 5 ms / 帧**（224×224 输入，RTX 4090）
-> - **记忆树**（Memory Tree）：HMT 跨帧在线增量维护层级语义记忆，分支/合并操作均为 O(depth) 复杂度，目标是 **< 1 ms / 帧** 增量更新
+> 本文档以当前工作区实现为准，覆盖源码、配置、文档、数据集目录和评测脚本的实际状态。
 >
-> 两棵树并行：视觉树提供当前帧的空间语义特征，记忆树提供跨时间尺度的任务上下文，共同驱动动作头完成长时程操作。
+> 文档定位不是“概念草图”，而是面向论文撰写、复现实验、代码审阅和后续重构的技术基线。所有核心描述均以当前仓库中的真实代码路径为依据。
+
+---
 
 ## 目录
 
-1. [项目概述](#1-项目概述)
-2. [整体架构框图](#2-整体架构框图)
-3. [架构组件详解](#3-架构组件详解)
-   - 3.1 [JumpAwareHead（纯动作跳变感知头）](#31-jumpawarehead纯动作跳变感知头)
-   - 3.2 [SGMTS（语义引导 Mamba 树扫描编码器）](#32-sgmts语义引导-mamba-树扫描编码器)
-   - 3.3 [HierarchicalMemoryTree（层级记忆树）](#33-hierarchicalmemory-tree层级记忆树)
-   - 3.4 [CrossModalFusion（跨模态融合）](#34-crossmodalfusion跨模态融合)
-   - 3.5 [FlowMatchingActionHead（流匹配动作头）](#35-flowmatchingactionhead流匹配动作头)
-4. [两阶段训练流程](#4-两阶段训练流程)
-5. [核心设计原则：损失函数完全分离](#5-核心设计原则损失函数完全分离)
-6. [损失函数详解](#6-损失函数详解)
-   - 6.1 [预训练损失](#61-预训练损失)
-   - 6.2 [Phase 1/2 损失](#62-phase-12-损失)
-7. [模型 Forward API](#7-模型-forward-api)
-8. [项目文件结构](#8-项目文件结构)
-9. [快速开始](#9-快速开始)
+1. [文档定位与扫描范围](#1-文档定位与扫描范围)
+2. [项目定义与核心结论](#2-项目定义与核心结论)
+3. [工作区全景与事实来源](#3-工作区全景与事实来源)
+4. [当前主实现路径与遗留路径](#4-当前主实现路径与遗留路径)
+5. [整体系统架构](#5-整体系统架构)
+6. [与 Evo-1 骨架的接口设计](#6-与-evo-1-骨架的接口设计)
+7. [主干网络：InternVL3Backbone 与 InternVL3Embedder](#7-主干网络internvl3backbone-与-internvl3embedder)
+8. [DualTreeAdapter_Evo1：当前训练与推理主入口](#8-dualtreeadapter_evo1当前训练与推理主入口)
+9. [视觉树：SGMTS](#9-视觉树sgmts)
+10. [门控融合：GateFusion](#10-门控融合gatefusion)
+11. [记忆树：HierarchicalMemoryTree](#11-记忆树hierarchicalmemorytree)
+12. [树读出：TreeSSMReadout](#12-树读出treessmreadout)
+13. [语义提升：MLPElevation 与树操作](#13-语义提升mlpelevation-与树操作)
+14. [跳变检测：JumpAwareHead](#14-跳变检测jumpawarehead)
+15. [动作生成：FlowMatchingActionHead](#15-动作生成flowmatchingactionhead)
+16. [遗留设计路径：policy/CrossModalFusion 分支](#16-遗留设计路径policycrossmodalfusion-分支)
+17. [数据集与数据加载](#17-数据集与数据加载)
+18. [训练流程](#18-训练流程)
+19. [评估与可视化流程](#19-评估与可视化流程)
+20. [配置系统与关键超参数](#20-配置系统与关键超参数)
+21. [工程实现细节与性能注意事项](#21-工程实现细节与性能注意事项)
+22. [论文撰写时必须注明的实现事实](#22-论文撰写时必须注明的实现事实)
+23. [当前项目文件结构说明](#23-当前项目文件结构说明)
 
 ---
 
-## 1. 项目概述
+## 1. 文档定位与扫描范围
 
-DualTreeVLA 是一个面向长时程机器人操作的视觉-语言-动作模型（VLA），其名称中的**「双树」**明确指代同时维护的两棵树结构：
+本文档基于对当前工作区的系统扫描整理而成，覆盖范围包括：
 
-| 树 | 全称 | 作用 | 延迟目标 |
-|----|------|------|----------|
-| **视觉树** | Semantic-Guided Visual Tree（SGMTS） | 每帧在 patch 空间动态构建语义加权 MST，Mamba BFS 扫描输出空间语义特征 | **< 5 ms / 帧** |
-| **记忆树** | Hierarchical Memory Tree（HMT） | 跨帧增量维护层级语义记忆，O(depth) 分支/合并，记录子任务边界与历史上下文 | **< 1 ms / 帧**（增量更新） |
+- 根目录入口脚本：pretrain.py、train.py、eval.py
+- 包代码：dual_tree_vla/adapter/、dual_tree_vla/model/、dual_tree_vla/dataset/、dual_tree_vla/losses/、dual_tree_vla/policy/、dual_tree_vla/common/
+- 配置：dual_tree_vla/config/*.yaml 与 dual_tree_vla/config/deepspeed/*.json
+- 文档：README.md、REFACTOR_PLAN.md、docs/project_status.md、docs/evo1_analysis.md
+- 运行脚本：scripts/*.py 与 scripts/*.sh
+- 数据目录结构：data/libero/、data/RoboCerebra/
+- 模型权重目录结构：model_weights/InternVL3-1B/、model_weights/CLIP/
 
-两棵树以**最低推理延迟**并行执行：视觉树负责当前帧的空间语义编码，记忆树负责全局任务记忆读取，共同输入动作头完成连续动作生成。整体推理延迟目标：**单帧端到端 < 50 ms**（不含 LLM prefill）。
+说明：
 
-核心设计原则：
-
-- **双树并行**：Visual Tree（每帧重建）与 Memory Tree（增量更新）解耦执行，互不阻塞
-- **轻量视觉树扫描**：SGMTS 避免 Transformer 注意力的 $O(P^2)$ 复杂度，改用线性 Tree-SSM $O(P)$ 扫描；MST 构建采用 CPU 上 Kruskal 算法与 GPU 特征提取流水线并行
-- **O(depth) 记忆树更新**：HMT 每帧仅更新活跃叶子的 Welford 均值（Merge），分支时仅沿路径更新祖先链，节点数控制在 $\leq 4$ 层
-- 用 JumpAwareHead 检测动作突变点（= 分支点），自动分割子任务边界
-- 用 FlowMatching 动作头生成连续动作序列
+- 本文档会扫描并总结数据集目录、元数据文件和 README，但不会逐个解析大型二进制数据文件。
+- 论文或技术报告中若出现与本文档不一致的描述，应以当前源码为准，再回到本文档修正，而不是相反。
 
 ---
 
-## 2. 整体架构框图
+## 2. 项目定义与核心结论
 
-### 2.1 双树并行结构（低延迟核心）
+### 2.1 项目定义
 
-```
- ╔══════════════════════════════════════════════════════════╗
- ║              DualTreeVLA — 双树并行架构                   ║
- ║                                                          ║
- ║  ┌─────────────────────────────────────┐                 ║
- ║  │  🌿 视觉树（Visual Tree）— SGMTS    │  目标: <5ms/帧  ║
- ║  │  patch MST + BFS + Mamba Tree-SSM  │  O(P) 线性复杂度 ║
- ║  └─────────────────────────────────────┘                 ║
- ║                   ↕ 语义引导（s_top）                     ║
- ║  ┌─────────────────────────────────────┐                 ║
- ║  │  🌳 记忆树（Memory Tree）— HMT     │  目标: <1ms/帧  ║
- ║  │  增量 Merge/Branch，O(depth) 更新  │  max depth=4     ║
- ║  └─────────────────────────────────────┘                 ║
- ╚══════════════════════════════════════════════════════════╝
-```
+DualTreeVLA 是一个面向视觉-语言-动作模型的双树增强模块。它不是独立的 VLA 骨架，而是一个围绕现有骨架构建的旁路增强层，当前主实现面向 Evo-1 风格骨架，即：
 
-### 2.2 单帧 Forward 数据流
+- 视觉主干：InternVL3
+- 语言主干：InternVL3 内部 language model
+- 动作头：Flow Matching Action Head
 
-```
-  ┌──────────────────────────┐              ┌──────────────────────┐
-  │      任务描述 text          │              │    RGB 帧 I_t         │
-  │      (List[str])           │              │    (B, C, H, W)      │
-  └──┬───────────────────┬────┘              └──────────┬───────────┘
-     │ g_task            │ task_tokens                  │
-     ▼                   │                    ▼ [视觉树 <5ms]
-  ┌──────────────────────────────────┐    ┌──────────────────────────────────────┐
-  │  🌿 SGMTS（视觉树 / Visual Tree）│◄───┤  🌳 HMT（记忆树 / Memory Tree）      │
-  │   语义加权MST + BFS + Tree-SSM   │s_top│  Merge(<1ms): Welford 更新 z_v      │
-  │   O(P) Mamba 扫描，无 O(P²) Attn│    │  Branch+Elevate: O(depth) 路径更新  │
-  └──────────────┬────────────────────┘    │    MLPElevation → s_abs              │
-                 │ Z_v (B, N_v, d)          └──────────────▲───────────┬────────────┘
-                 │◄──── task_tokens                        │ p_jump    │ s_top
-                 │◄──── s_top (← HMT) ────────────────────┘            │
-                 ▼                                                       │
-  ┌──────────────────────────────────┐                                   │
-  │           LLM (Qwen2.5)           │◄──────────────────────────────────┘
-  │   [task_tokens ; Z_v ; s_top]     │   (s_top 作为高层语义 token)
-  │   → H (B, N, d_llm)              │
-  └──────────────┬────────────────────┘
-                 │ H                   q_t (B, d_q)
-                 └──────────────────────────┐
-                               [H ; q_t]    ▼
-                 ┌──────────────────────────────────┐
-                 │         FlowMatchingHead           │
-                 │     v_θ(x_t, t, [H ; q_t])        │
-                 │    → â_{1..Ha} (B, Ha, d_a)       │
-                 └──────────────┬───────────────────┘
-                                │ â_1 (B, d_a)
-                                ▼
-                 ┌──────────────────────────────────┐
-                 │           JumpAwareHead            │
-                 │         动作 Mamba SSM             │──── p_jump ────────────────► HMT
-                 │     → p_jump (B,) ∈ [0,1]        │
-                 └──────────────────────────────────┘
-```
+DualTreeVLA 的核心思想是：
 
+1. 不拆解或重写骨架内部 ViT 与 LLM 的预训练结构。
+2. 通过只读 hook 获取视觉 patch 特征。
+3. 通过门控融合把增强后的视觉 patch 特征回写到骨架视觉流。
+4. 通过记忆树读出一个额外记忆 token，并追加到 LLM 输入序列末尾。
 
+### 2.2 当前代码层面的核心事实
+
+当前仓库存在两条并行的“架构叙事”：
+
+- 一条是当前真实训练路径：DualTreeAdapter_Evo1 + InternVL3Backbone
+- 一条是遗留/重构中的设计路径：policy/DualTreeVLA + CrossModalFusion
+
+其中真正被 train.py、pretrain.py、eval.py、scripts/eval_server.py 使用的是前者；后者仍存在于仓库中，但不是当前主训练、离线评测或在线推理入口。
+
+### 2.3 对论文写作最重要的结论
+
+如果基于当前代码写论文，必须以如下实现为主描述对象：
+
+- 视觉增强：SGMTS 直接处理 InternVL3 ViT 末层 patch 特征
+- 融合方式：GateFusion 将 SGMTS 输出与原始 patch 特征逐元素门控融合
+- 记忆注入：记忆树读出的 m_ctx 经过 mem_proj 后拼接到 LLM 输入序列
+- 动作预测：FlowMatchingActionHead 接收 LLM 最后层 CLS 位置隐状态
+- Phase 1/2 当前主训练中并没有走 CrossModalFusion -> 多 token context -> action head 这条路径
+
+这点与较早期设计文档、部分旧说明和 policy/dual_tree_policy.py 中的设计并不完全一致。
 
 ---
 
-## 3. 架构组件详解
+## 3. 工作区全景与事实来源
 
-### 3.1 JumpAwareHead（纯动作跳变感知头）
+### 3.1 源码主目录
 
-**文件**: `dual_tree_vla/model/semantic_jump_head.py`
+当前源码按功能分为如下几层：
 
-**设计原则**：只消费动作序列，完全不接触语义特征。
+- dual_tree_vla/adapter/：骨架适配器，当前主入口
+- dual_tree_vla/model/backbone/：InternVL3 自包含骨架封装
+- dual_tree_vla/model/sgmts/：视觉树模块
+- dual_tree_vla/model/memory_tree/：记忆树、树操作、Tree-SSM 读出
+- dual_tree_vla/model/action_head/：Flow Matching 动作头与 JumpAwareHead 导出
+- dual_tree_vla/model/common/：注意力与融合等通用模块
+- dual_tree_vla/dataset/：RoboCerebra、RoboCerebraBench、LIBERO 加载器
+- dual_tree_vla/policy/：遗留/重构中的策略层
+- dual_tree_vla/common/：训练与工程工具函数
 
-```
-输入:
-  A_act  (B, L, d_a)  — 当前活跃节点的动作历史（max_len=64，尾部截断）
-  a_new  (B, d_a)     — 当前时刻动作
+### 3.2 根目录入口
 
-前向流程:
-  [A_act; a_new]  → Linear(d_a→d_inner)  → seq (B, L+1, d_inner)
-  seq             → 一层 Mamba-SSM（ZOH离散化，选择性扫描）
-  末尾隐状态 h_ctx (B, d_inner)
-  h_ctx           → Linear(d_inner→1)
-  
-输出:
-  p_jump (B,)  ∈ [0,1]   — 跳变概率（≥0.5 创建分支节点）
-  logit  (B,)            — 原始 logit（供 BCEWithLogitsLoss）
-```
+根目录脚本对应当前标准工作流：
 
-**参数量**: 约 0.05M
+- pretrain.py：Stage 0 预训练入口
+- train.py：Phase 1 / Phase 2 训练入口
+- eval.py：离线评估入口，已切换到 InternVL3Backbone + DualTreeAdapter_Evo1 主链路
 
-#### Mamba SSM 数学公式（ZOH 离散化）
+### 3.3 辅助脚本
 
-输入嵌入：
+- scripts/pretrain.sh：多卡预训练启动脚本
+- scripts/train_phase1.sh：Phase 1 启动脚本
+- scripts/train_phase2.sh：Phase 2 启动脚本
+- scripts/pretrain_eval.py：预训练树结构与热力图可视化
+- scripts/eval_server.py：WebSocket 推理服务端，加载仓内 Evo1 backbone + adapter
+- scripts/eval_client.py：LIBERO 仿真客户端，发送 Evo1 风格多视角 JSON（image 列表 + image_mask）
+- scripts/extract_pretrain_features.py：RoboCerebra 预提取视觉特征缓存
 
-$$x_t = W_\text{embed}\, a_t \in \mathbb{R}^{d_\text{inner}}$$
+### 3.4 文档层事实来源
 
-输入依赖参数（选择性机制）：
+- README.md：面向使用者的训练/评估说明
+- REFACTOR_PLAN.md：目录重构计划，不等于当前真实结构
+- docs/project_status.md：历史问题记录，含部分已过时信息
+- docs/evo1_analysis.md：Evo-1 对照分析
 
-$$\Delta_t = \text{softplus}(W_\Delta\, x_t) \in \mathbb{R}^{d_\text{inner}}, \quad B_t = W_B\, x_t \in \mathbb{R}^{d_\text{state}}, \quad C_t = W_C\, x_t \in \mathbb{R}^{d_\text{state}}$$
+### 3.5 数据目录事实来源
 
-ZOH 离散化（$A$ 为固定 S4D-real 对角矩阵，$A_{nd} = -n,\ n\in[1,d_\text{state}]$）：
+扫描到的数据目录如下：
 
-$$\bar{A}_t = \exp(\Delta_t \cdot A) \in \mathbb{R}^{d_\text{inner} \times d_\text{state}}, \qquad \bar{B}_t = \Delta_t \cdot B_t$$
+- data/libero/libero_10/、libero_spatial/、libero_object/、libero_goal/
+- data/libero/LIBERO/：LIBERO 工具库与官方项目
+- data/RoboCerebra/RoboCerebra_trainset/
+- data/RoboCerebra/RoboCerebraBench/
 
-状态递推与输出：
+其中：
 
-$$h_t = \bar{A}_t \odot h_{t-1} + \bar{B}_t \odot x_t, \qquad y_t = C_t^\top h_t + D \odot x_t$$
-
-分类头（取末尾时刻隐状态）：
-
-$$\text{logit} = W_\text{cls}\;\text{LayerNorm}(h_L) \in \mathbb{R}$$
-
-**边界标签生成（自监督）**：
-
-$$y_t = \mathbf{1}\bigl[\|a_t - \bar{a}_\text{act}\| > \gamma\,\sigma_\text{act}\bigr], \quad \gamma = 2.0$$
-
-其中 $\bar{a}_\text{act}$、$\sigma_\text{act}$ 为活跃节点动作历史的均值与标准差。
-
-### 3.2 SGMTS（语义引导 Mamba 树扫描编码器）— 视觉树
-
-**文件**: `dual_tree_vla/model/sgmts/sgmts.py`
-
-> **视觉树（Visual Tree）**：SGMTS 是双树中的第一棵树。每帧独立在图像 patch 特征图上构建一棵语义加权最大生成树（MST），以 Mamba Tree-SSM 沿 BFS 序进行线性时间扫描，输出语义增强的逐 patch 特征。
->
-> **延迟目标 < 5 ms / 帧**（224×224 输入，batch=1，RTX 4090）：
-> - MST 构建（Kruskal）：$O(E \log E)$，$E = O(P)$（4-邻域），CPU 上约 **0.3–0.8 ms**
-> - Tree-SSM 扫描：$O(P \cdot d_f \cdot d_\text{state})$，纯 GPU 向量化，约 **1–2 ms**
-> - CLIP patch 提取（冻结，adapter only）：约 **2–3 ms**
-> - **合计 < 5 ms**，远低于 Self-Attention 的 $O(P^2)$ ViT 方案（同尺寸 ~18 ms）
-
-SGMTS 在 GrootV 的 Mamba 树扫描（`tree_scanning.py: MinimumSpanningTree + BFS + Tree_SSM`）基础上引入层级语义引导，将任务描述和 HMT 高层抽象节点的语义同时注入扫描过程。整体架构如下：
-
-```
-输入图像
-    ↓
-[CLIP Vision Encoder] ──────→ patch 特征 [B, P, d_f] ────┐
-    │                                                       ▼
-[CLIP Text Encoder] ←── 文本/类别提示 ───────→ [语义引导树构建器]
-                                                    │
-                                            语义重要性图 + 树拓扑
-                                                    │
-                                            [MambaTree扫描层]
-                                                    │
-                                            语义增强视觉特征
-                                                    │
-                                            [下游任务头]
-```
+- data/libero/libero_10/meta/info.json 明确给出 total_episodes=379、total_frames=101469、fps=10
+- RoboCerebra 的结构则通过加载器代码来定义和验证
 
 ---
 
-#### 视觉骨干：CLIP 双编码器（无需 mini-imagenet 预训练）
+## 4. 当前主实现路径与遗留路径
 
-> **核心思路**：CLIP 同时提供 Vision Encoder（单尺度 patch 级视觉特征）和 Text Encoder（文本语义向量），两路输出共同驱动语义引导树构建器。Vision Encoder 以固定 patch_size=16 切割图像，输出 patch 特征序列 $(B, P, d_f)$，Text Encoder 将任务描述/类别提示编码为跨模态对齐的语义向量，二者在语义引导树构建器中融合，生成**语义重要性图**和**树拓扑**，再由 MambaTree 扫描层完成序列化编码。
+### 4.1 当前主实现路径
 
-```
-输入图像 (B, C, H, W)
-      ↓
-[CLIP Vision Encoder]  ← 冻结，直接使用预训练权重
-  └─→ patch 特征 [B, P, d_f]          # patch_size=16 单尺度，P = (H/16)×(W/16)
+当前真正用于训练、离线评测和在线推理主实验的路径为：
 
-文本/类别提示 (str / token_ids)
-      ↓
-[CLIP Text Encoder]   ← 冻结，跨模态语义对齐
-      ↓
-文本语义向量 g_text ∈ R^{d_lang}
-
-[视觉特征] + [文本语义向量]
-      ↓
-[语义引导树构建器]
-  ├─→ 语义重要性图 σ_i = cos(p_i, g_sem) ∈ R^P
-  └─→ 树拓扑（语义加权 MST + 动态语义根 r*）
-      ↓
-[MambaTree 扫描层]   # Tree-SSM 沿 BFS 序递推
-      ↓
-语义增强视觉特征 Z_v ∈ R^{P × d_visual}
-      ↓
-[下游任务头]         # 动作解码 / 融合 / 分类
+```text
+train.py / pretrain.py / eval.py / scripts/eval_server.py
+    -> dual_tree_vla.model.backbone.InternVL3Backbone
+    -> dual_tree_vla.adapter.DualTreeAdapter_Evo1
+    -> SGMTS + GateFusion + HMT + TreeSSMReadout + mem_proj
+    -> InternVL3 language_model
+    -> InternVL3Backbone.action_head.predict_action()
 ```
 
-- `CLIPPatchExtractor`：封装 `transformers.CLIPVisionModel`，冻结所有 CLIP 参数，仅 Adapter（Linear + LayerNorm）参与训练
-- 文本编码路径：通过 `lang_gate` 线性层将 `g_task`（LLM 均值池化嵌入）投影到视觉空间，对齐两路特征维度
-- **优势**：Vision Encoder 特征和 Text Encoder 特征已在同一语义空间对齐，语义重要性图可直接反映图像区域与任务描述的跨模态相关度
+### 4.2 遗留/规划路径
+
+仓库中还存在一条未作为当前主训练入口使用的策略路径：
+
+```text
+dual_tree_vla.policy.DualTreeVLA
+    -> SGMTSEncoder
+    -> CrossModalFusion
+    -> FlowMatchingActionHead
+```
+
+这条路径仍然具有文档和代码价值：
+
+- 它保留了更“论文化”的模块分层表达
+- 它解释了 CrossModalFusion 这个组件为何仍存在于仓库中
+- 它与 REFACTOR_PLAN.md 中的策略层目标一致
+
+但必须强调：它不是当前 train.py、pretrain.py、eval.py 或 scripts/eval_server.py 调用的真实路径。
+
+### 4.3 文档撰写建议
+
+若论文描述“系统设计理念”，可以介绍二者关系：
+
+- “设计上”有明确的视觉树、记忆树、跨模态融合、动作生成四层结构
+- “当前实现上”主训练路径采用 DualTreeAdapter_Evo1，其中跨模态融合退化为“视觉门控融合 + 记忆 token 拼接”而不是单独的 CrossModalFusion 模块
 
 ---
 
-#### 步骤 1：语义引导向量构造（分层）
+## 5. 整体系统架构
 
-CLIP Text Encoder 将文本/类别提示编码为 $g_\text{text}$，再与 HMT 子任务嵌入 $\bar{s}_\text{top}$ 混合：
+### 5.1 顶层数据流
 
-$$g_\text{sem} = \begin{cases} g_\text{task} & \text{HMT 尚未建立（第0帧）} \\ \displaystyle\frac{1}{|S_\text{top}|}\sum_{k \in S_\text{top}} s_k & \text{HMT 已有 ≥2 层非叶子节点} \end{cases}$$
+当前主路径的单帧前向可以写成：
 
-其中 $S_\text{top}$ 为 HMT **最顶两层非叶子节点**（BFS 深度 0~1）的语义嵌入集合；$g_\text{task}$ 为 LLM 对任务描述的均值池化嵌入。二者混合：
+$$
+I_t \xrightarrow{\text{InternVL3 ViT}} P_t
+$$
 
-$$g_\text{sem} = \beta\, g_\text{task} + (1-\beta)\,\bar{s}_\text{top}, \quad \beta \in [0,1] \text{（随树深度线性衰减）}$$
+$$
+P_t \xrightarrow{\text{SGMTS}} Z_v
+$$
 
-> **直觉**：树刚建立时以总任务为中心扫描；随子任务抽象节点出现，逐渐以当前活跃子任务语义为中心。
+$$
+V_t' = \operatorname{GateFusion}(Z_v, P_t)
+$$
+
+$$
+V_t' \xrightarrow{\text{pixel shuffle + mlp1}} E_t^{vis}
+$$
+
+$$
+\bigl[E_t^{text}; E_t^{vis}; e_{mem}\bigr] \xrightarrow{\text{LLM}} H_t
+$$
+
+$$
+h_t^{cls} = H_t[:,0,:]
+$$
+
+$$
+\hat{A}_{t:t+H_a-1} = \operatorname{FlowHead}(h_t^{cls}, q_t)
+$$
+
+其中：
+
+- $P_t$ 为 ViT 末层 patch 特征
+- $Z_v$ 为视觉树增强后的 patch 特征
+- $e_{mem}$ 为记忆树读出后经 mem_proj 映射的记忆 token
+- $h_t^{cls}$ 为 LLM 输出序列的第一个位置隐状态
+
+### 5.2 双树并行机制
+
+系统存在两棵树：
+
+1. 视觉树 SGMTS
+   - 作用在单帧图像 patch 图结构上
+   - 建树对象是空间 patch 节点
+   - 输出是增强后的 patch 序列
+
+2. 记忆树 HMT
+   - 作用在时间序列的跨帧记忆上
+   - 建树对象是历史子任务片段或抽象语义节点
+   - 输出是一个低维记忆表征向量
+
+这两棵树分别对应：
+
+- 空间结构建模
+- 时间层级建模
+
+从研究视角看，这构成了空间树与时间树的双树协同系统。
+
+### 5.3 训练阶段的系统角色分工
+
+- Stage 0：训练双树模块本身学会边界检测、语义提升和空间扫描
+- Phase 1：在冻结骨架下学习双树输出如何影响动作预测
+- Phase 2：在保留 ViT 冻结的同时，低学习率放开 LLM 进一步适配任务
 
 ---
 
-#### 步骤 2：语义引导树构建器
+## 6. 与 Evo-1 骨架的接口设计
 
-语义引导树构建器接收**视觉特征**（Vision Encoder 输出的空间特征图）和**文本语义向量**（$g_\text{sem}$），输出两个核心结构：
+### 6.1 设计原则
 
-**① 语义重要性图**：对每个 patch 计算与 $g_\text{sem}$ 的跨模态相似度：
+当前适配器实现遵循三条原则：
 
-$$\sigma_i = \cos(p_i,\; W_g\, g_\text{sem}) \in [-1, 1], \quad i = 1, \ldots, N_p$$
+1. 只读提取骨架内部中间特征
+2. 不改写骨架权重加载逻辑
+3. 双树模块通过最少接口注入增强信息
 
-$\sigma_i$ 构成空间语义热图，高值区域为当前任务焦点。
+### 6.2 接口 1：ViT 末层 forward hook
 
-**② 树拓扑（语义根节点选择）**：GrootV 中 BFS 根隐式由 MST 结构决定，等效于从某固定角落出发。SGMTS 改为**显式语义根**：
+适配器在 vision_model.encoder.layers[-1] 上注册 forward hook，抓取最后一层输出：
 
-$$r^* = \arg\max_{i} \sigma_i$$
+- 若输出为 tuple，则取 output[0]
+- 保存在 self._P_t_raw
 
-$r^*$ 是语义最相关的 patch，作为 BFS 起始根，确保 SSM 最先编码任务焦点区域。
+其作用是获得包含 CLS 的 ViT hidden states，再在后续处理中裁掉 CLS：
+
+$$
+P_t = \text{hs}[:,1:,:]
+$$
+
+### 6.3 接口 2：视觉 token 回写
+
+SGMTS 在 ViT patch 空间中工作，输出与原始 patch 特征同维度的 $Z_v$。随后通过 GateFusion 得到 $V_t'$，再送入：
+
+- pixel_shuffle
+- mlp1
+
+这一步把增强后的 patch 特征重新映射回 InternVL3 的语言嵌入空间，以便继续走原生的多模态 prompt 融合流程。
+
+### 6.4 接口 3：记忆 token 追加
+
+记忆树读出的 $m_{ctx}$ 经线性层 mem_proj 投影后，拼接在 input_embeds 最后：
+
+$$
+e_{mem} = W_{mem} m_{ctx}
+$$
+
+$$
+E_t = [E_t^{orig}; e_{mem}]
+$$
+
+同时 attention mask 末尾补 1。
+
+### 6.5 为什么这套接口是“零侵入”的
+
+因为：
+
+- AutoModel.from_pretrained() 的调用方式未改变
+- ViT、LLM、mlp1 的权重结构未改变
+- 不需要重训骨架预训练权重
+- 适配器只包裹骨架，不替换骨架内部模块
+
+这使得 DualTreeVLA 可以被理解为“骨架外部的可训练旁路增强层”。
 
 ---
 
-#### 步骤 3：语义加权 MST 构建
+## 7. 主干网络：InternVL3Backbone 与 InternVL3Embedder
 
-相邻 patch 的边权（取代 GrootV 纯 Cosine），结合语义重要性图 $\sigma$：
+### 7.1 InternVL3Backbone 的职责
 
-$$w_{ij} = \underbrace{\cos(p_i,\, p_j)}_{\text{视觉相似度}} + \alpha\;\underbrace{\sigma_i \cdot \sigma_j}_{\text{任务/子任务相关度偏置}}$$
+dual_tree_vla/model/backbone/backbone.py 中的 InternVL3Backbone 负责两件事：
 
-$\alpha = 0.5$（默认）。Kruskal 最大生成树在此新边权上建 MST，再从 $r^*$ 出发 BFS 得扫描序列。
+1. 持有 InternVL3Embedder
+2. 持有 FlowMatchingActionHead
 
-> **效果**：高权边连接两个都与当前子任务相关的 patch，MST 优先将它们串联；BFS 从语义中心向外展开，SSM 隐态在遍历到非相关区域前已编码充分的任务上下文。
+其接口非常薄，核心方法是：
+
+- predict_action(fused_tokens, state, actions_gt=None, action_mask=None)
+
+### 7.2 InternVL3Embedder 的职责
+
+InternVL3Embedder 封装了：
+
+- tokenizer
+- InternVL3 主模型
+- 图像预处理
+- 构造多模态 prompt
+- 将视觉 token 注入到 language model 输入 embedding 序列
+
+### 7.3 图像预处理
+
+_preprocess_images() 的输入是 List[Image | Tensor]，输出：
+
+- pixel_values：所有图像切片拼接后的张量
+- num_tiles_list：每张图对应的 tile 数
+
+该函数支持：
+
+- PIL 图像
+- Tensor 图像
+- 多余维度自动下采样到单帧
+
+### 7.4 多模态 prompt 构建
+
+_build_multimodal_prompt() 会把 <image> 占位符替换成 InternVL3 所需的：
+
+- <img>
+- 若干 <IMG_CONTEXT> token
+- </img>
+
+这意味着视觉 token 的序列长度由 tile 数决定，而不是固定写死。
+
+### 7.5 LLM 输入 embedding 注入
+
+_prepare_and_fuse_embeddings() 会：
+
+1. 找到 prompt 中图像上下文 token 的位置
+2. 用 vit_embeds 覆盖这些位置的 embedding
+3. 按 image_mask 屏蔽无效相机 token
+
+这里 DualTreeAdapter 的作用，就是把原本来自骨架 extract_feature() 的 vit_embeds 替换为双树增强后的版本。
+
+### 7.6 Flash Attention 支持
+
+当前骨架加载时传入：
+
+- use_flash_attn=True
+
+此外，注意力实现层还支持两级回退：
+
+1. flash_attn 包
+2. torch.nn.functional.scaled_dot_product_attention
+3. 手写 softmax attention fallback
+
+因此仓库对 Flash Attention 是“代码已支持，是否真正生效取决于运行环境和依赖安装”的状态。
 
 ---
 
-#### 步骤 4：MambaTree 扫描层（语义增强输入）
+## 8. DualTreeAdapter_Evo1：当前训练与推理主入口
 
-MambaTree 扫描层接收语义引导树构建器的输出（树拓扑 + 语义重要性图），以语义增强的输入 $X_i$ 替代原始 patch 特征：
+### 8.1 类职责
 
-$$X_i = p_i + \sigma_i \cdot W_{g'}\, g_\text{sem}$$
+dual_tree_vla/adapter/evo1_adapter.py 中的 DualTreeAdapter_Evo1 是当前真实主模型。它把以下组件组合在一起：
 
-即在每个 patch 特征上叠加按其语义重要性 $\sigma_i$ 加权的任务向量，使 SSM 在扫描时同时感知视觉内容和语义显著程度。
+- backbone
+- sgmts
+- gate_fuse
+- jump_head
+- tree_ssm
+- mlp_elev
+- mem_proj
+- sem_proj
 
-Tree-SSM 沿 BFS 序递推（同 GrootV `tree_scanning_core`）：
+### 8.2 适配器维护的状态
 
-$$h_i = \bar{A}_i \odot h_{\text{parent}(i)} + \bar{B}_i \odot X_i, \qquad z_i = C_i^\top h_i + D \odot X_i$$
+它内部维护三类重要状态：
 
-父子关系由树拓扑决定（树形依赖，非线性链）。每个 patch 的输出 $z_i$ 携带从根到该节点路径上的完整语义上下文。
+1. _P_t_raw
+   - 保存 hook 抓取到的 ViT hidden states
 
-**输出**：语义增强视觉特征，按原始 patch 位置重排后送入下游任务头：
+2. _tree_pool
+   - 字典，batch_idx -> HierarchicalMemoryTree
+   - 用于多样本并行时为每个样本保存独立记忆树
 
-$$Z_v \in \mathbb{R}^{P \times d_\text{visual}}$$
+3. _mount_tau / _delta_w
+   - 用于 HMT 插入规则
+
+### 8.3 _embed_with_dual_tree()
+
+这是单样本主前向的核心步骤：
+
+1. 图像预处理与 extract_feature()
+2. 通过 hook 获取 P_t
+3. 编码任务文本得到 g_task
+4. 从当前记忆树提取顶层抽象节点均值 s_top
+5. SGMTS(P_t, g_task_tiled, s_top_list) -> Z_v
+6. GateFusion(Z_v, P_t) -> V_t'
+7. pixel_shuffle + mlp1 -> vit_embeds_new
+8. 构建 prompt 与 input_embeds
+9. 从 HMT 读取 m_ctx，经 mem_proj 拼接到序列末尾
+10. 调用 language model，返回最后层 hidden states
+
+### 8.4 _embed_batch_flow()
+
+这是近期为解决 Phase 1/2 训练过慢问题引入的批量前向优化路径。它的关键思想是：
+
+- Phase 1/2 并不在主训练中逐步更新 HMT 结构
+- 因此可以把每个 batch 中每个样本原本串行的 ViT + LLM 前向合并成：
+  - 一次共享 ViT forward
+  - 一次共享 LLM forward
+
+这使得 Phase 1/2 不再因为 for b in range(B) 重复走完整骨架而被严重拖慢。
+
+### 8.5 forward() 的三种模式
+
+适配器的 forward() 按 mode 分三类：
+
+1. pretrain
+   - 保留逐样本逻辑
+   - 因为需要逐轨迹、逐帧更新 HMT
+   - 计算 L_boundary、L_sem、L_elev
+
+2. phase1
+   - 走 _embed_batch_flow()
+   - 仅计算 L_flow
+
+3. phase2
+   - 同样走批量 flow 路径
+   - 仅计算 L_flow
+
+### 8.6 inference()
+
+推理路径复用单样本嵌入逻辑，最后调用：
+
+$$
+\hat{A} = \text{backbone.predict_action}(h^{cls}, q)
+$$
+
+其中 predict_action() 在没有 actions_gt 时返回采样得到的动作 chunk。
 
 ---
 
-#### 创新点总结（相对 GrootV）
+## 9. 视觉树：SGMTS
 
-| 机制 | GrootV（原版） | SGMTS（本工作） |
-|------|-------------|--------------|
-| 视觉特征来源 | 随机初始化骨干 | CLIP Vision Encoder（单尺度 patch 特征，patch_size=16） |
-| 文本/语义输入 | 无 | CLIP Text Encoder（文本/类别提示 → 跨模态对齐向量） |
-| 语义重要性图 | 无 | $\sigma_i = \cos(p_i, W_g g_\text{sem})$ 空间热图 |
-| BFS 根 | 固定（隐式左上角） | 动态语义根 $r^* = \arg\max \sigma_i$ |
-| 边权 | 纯视觉 Cosine | 视觉 Cosine + $\sigma_i \cdot \sigma_j$ 偏置 |
-| SSM 输入 | 原始 patch 特征 | 语义增强输入 $X_i = p_i + \sigma_i \cdot W_{g'} g_\text{sem}$ |
-| 语义引导来源 | 无 | CLIP Text Encoder + HMT 顶层抽象节点（自适应切换） |
+### 9.1 模块定位
 
-**三条简单但有效的创新**：
-1. **CLIP 双编码器驱动**：Vision Encoder 提供多尺度视觉特征，Text Encoder 提供跨模态语义向量，二者在语义引导树构建器中联合生成语义重要性图，无需额外跨模态对齐训练。
-2. **语义根漂移**（Semantic Root Drift）：每帧根据 $\sigma$ 热图重选 $r^*$，根随任务焦点自然漂移，无任何额外参数。
-3. **$\beta$ 调度**（Task-to-Subtask Schedule）：$\beta$ 从 1.0 线性衰减到 0.3，树越深越信任子任务语义而非总任务，无需任何监督信号。
+SGMTS 位于 dual_tree_vla/model/sgmts/sgmts.py，是当前系统中负责空间结构建模的核心模块。与较早版本最大的不同是：
 
-**低延迟设计要点**：
-- MST 仅在 4-邻域（或 8-邻域）稀疏图上运行，边数 $E \leq 4P$，Kruskal 排序规模小，CPU 计算约 **0.3–0.8 ms**
-- Tree-SSM 递推在 BFS 序上展开为向量化矩阵乘，无 Python 循环热路径，GPU 单帧约 **1–2 ms**
-- 视觉树每帧**完全重建**（无状态），与记忆树增量更新解耦，两者可流水线并行执行，不引入额外同步开销
+- 不再独立使用 CLIP 视觉编码器作为主训练路径输入
+- 直接消费 InternVL3 ViT 最后一层 patch 特征
 
-### 3.3 HierarchicalMemoryTree（层级记忆树）— 记忆树
+这使它不再承担“另起一套视觉主干”的角色，而是骨架视觉特征的结构增强器。
 
-**文件**: `dual_tree_vla/model/memory_tree/`
+### 9.2 输入与输出
 
-> **记忆树（Memory Tree）**：HMT 是双树中的第二棵树。跨帧在线增量维护，以树形层级组织任务轨迹的语义记忆，供视觉树（SGMTS）提取当前子任务的引导向量 $s_\text{top}$，并向动作头提供历史上下文。
->
-> **延迟目标 < 1 ms / 帧**（增量更新，RTX 4090）：
-> - Merge 路径（大多数帧）：仅 Welford 均值更新，**O(1)**，< **0.05 ms**
-> - Branch+Elevate 路径（子任务边界帧）：沿祖先链 MLPElevation，**O(depth × MLP)**，depth ≤ 4，< **0.8 ms**
-> - 树节点数上界由 `max_tree_depth=4` 保证，不随轨迹长度增长
+输入：
 
-HMT 是在线构建的树形记忆结构。**叶子节点与抽象节点存储完全不同的字段**：
+- P_t：形状 (B, N_p, d_patch)
+- g_task：形状 (B, d_vit)
+- s_top：长度为 B 的列表，每项为抽象节点均值或 None
 
+输出：
+
+- Z_v：形状 (B, N_p, d_patch)
+
+可选输出：
+
+- sigma_maps：每个 patch 的语义重要性分数
+
+### 9.3 语义引导向量
+
+对第 $b$ 个样本，SGMTS 首先构造：
+
+$$
+g_{sem}^{(b)} = \beta g_{task}^{(b)} + (1-\beta)s_{top}^{(b)}
+$$
+
+如果没有可用的 s_top，则退化为纯任务语义引导：
+
+$$
+g_{sem}^{(b)} = g_{task}^{(b)}
+$$
+
+### 9.4 语义重要性图
+
+把 g_sem 投影到 patch 空间后，与每个 patch 计算 cosine 相似度：
+
+$$
+\sigma_i = \cos(p_i, W_g g_{sem})
+$$
+
+其中：
+
+- $p_i$ 是第 $i$ 个 patch 特征
+- $W_g$ 由 lang_gate 实现
+
+### 9.5 语义加权最大生成树
+
+SGMTS 并不是在完整图上建 MST，而是在规则网格的 4 邻域或 8 邻域边集上构图。边权定义为：
+
+$$
+w_{ij} = \cos(p_i, p_j) + \alpha \sigma_i \sigma_j
+$$
+
+当前默认：
+
+- alpha = 0.5
+- connectivity = 4
+
+然后使用 Kruskal 构造最大生成树。
+
+### 9.6 动态语义根与 BFS 扫描
+
+扫描根节点取：
+
+$$
+r^* = \arg\max_i \sigma_i
+$$
+
+也就是说不是固定从左上角开始，而是从语义响应最强的 patch 开始。然后按 BFS 生成树扫描顺序。
+
+### 9.7 Tree-SSM 扫描
+
+每个 patch 首先注入语义偏置：
+
+$$
+X_i = p_i + \sigma_i W_{g'} g_{sem}
+$$
+
+再沿 BFS 序执行树状 SSM 递推：
+
+$$
+h_i = \bar{A}_i \odot h_{par(i)} + \bar{B}_i \odot X_i
+$$
+
+$$
+z_i = C_i^\top h_i + D \odot X_i
+$$
+
+最后把扫描结果重排回原 patch 顺序，得到 $Z_v$。
+
+### 9.8 实现意义
+
+从论文角度，SGMTS 的意义可以概括为：
+
+- 使用语义引导的最优树结构代替局部卷积或全连接注意力
+- 在视觉主干被冻结时，仍为视觉 token 增加空间结构归纳偏置
+- 通过树状 SSM 将空间建图复杂度从全局注意力风格的二次成本压缩到线性或近线性成本
+
+---
+
+## 10. 门控融合：GateFusion
+
+### 10.1 模块位置
+
+dual_tree_vla/model/gate_fusion.py
+
+### 10.2 数学形式
+
+给定：
+
+- Z_v：SGMTS 输出
+- V_t：原始 ViT patch 特征
+
+先拼接再线性映射，得到门控权重：
+
+$$
+\alpha = \sigma\bigl(W_{gate}[Z_v; V_t]\bigr)
+$$
+
+然后融合：
+
+$$
+V_t' = \alpha \odot Z_v + (1-\alpha) \odot V_t
+$$
+
+### 10.3 初始化策略
+
+W_gate.weight 初始化为 0，bias 初始化为 -5。这意味着训练初期：
+
+$$
+\sigma(-5) \approx 0.0067
+$$
+
+即：
+
+$$
+V_t' \approx V_t
+$$
+
+这样做的工程价值很大：
+
+- 刚开始训练时不会大幅扰动骨架行为
+- 双树模块以“接近零增益”的方式接入系统
+- 后续再逐渐学到对哪些 patch 应增加增强分量
+
+这是当前实现中一个非常关键、也非常值得写入论文实现细节的稳定化设计。
+
+---
+
+## 11. 记忆树：HierarchicalMemoryTree
+
+### 11.1 模块定位
+
+dual_tree_vla/model/memory_tree/tree.py
+
+记忆树 HMT 用于在时间轴上维护任务执行的层级结构。它与视觉树不同，不在空间 patch 图上工作，而是在历史状态片段上工作。
+
+### 11.2 节点类型
+
+当前 HMT 节点支持两类：
+
+1. 叶子节点
+   - z_v：视觉语义向量
+   - a_hist：动作历史
+   - w：权重
+
+2. 抽象节点
+   - s：语义提升后的抽象向量
+   - w：权重
+
+### 11.3 维护目标
+
+HMT 试图把时间序列组织成一棵层级树，以回答两个问题：
+
+1. 当前片段是否应并入已有子任务
+2. 当前片段是否应该触发一个新的分支并形成新的高层抽象
+
+### 11.4 树更新的触发来源
+
+在预训练中，HMT 更新主要由：
+
+- 动作序列
+- JumpAwareHead 的边界判定
+- 当前视觉语义向量
+
+共同驱动。
+
+### 11.5 insert() 的意义
+
+当前实现中，insert() 是 HMT 的核心在线更新接口，它会根据：
+
+- 新的视觉表示
+- 当前动作
+- force_branch
+- 可选当前语义表示
+
+决定是：
+
+- merge 到活动叶子
+- branch 出新叶子
+- 触发后续 elevation
+
+### 11.6 深度控制
+
+配置项 max_tree_depth 用于限制树深。超过上限后会进行剪枝，以避免长轨迹导致记忆树无限增长。
+
+### 11.7 当前 Phase 1/2 与 HMT 的关系
+
+需要特别说明：
+
+- 预训练阶段，HMT 是主动更新的
+- 当前 Phase 1/2 主训练路径中，为了批量化提速，主训练并不在每个 batch step 上完整维护 HMT 动态
+- 因此 Phase 1/2 的“记忆 token”在批量路径中可以退化为零向量或简化读出
+
+这说明当前代码的研究重心更偏向：
+
+- 先把空间视觉增强与基本动作训练跑通
+- 再逐步恢复和强化时序记忆机制
+
+论文中若要宣称“完整在线记忆树已在所有阶段 fully active”，必须先核对实验具体使用的分支实现。
+
+---
+
+## 12. 树读出：TreeSSMReadout
+
+### 12.1 模块位置
+
+dual_tree_vla/model/memory_tree/tree_ssm.py
+
+### 12.2 输入对象
+
+输入不是普通张量，而是整个 HierarchicalMemoryTree 实例。
+
+### 12.3 只扫描“有语义的抽象节点”
+
+这是当前实现中极易被旧文档写错的一点。
+
+代码里真正的筛选条件是：
+
+- node.s is not None
+
+而不是简单的：
+
+- not node.is_leaf()
+
+原因是：
+
+- 剪枝后某些语义节点可能形式上变成没有子节点的“叶子”
+- 但它们仍然携带抽象语义 s
+- 因此仍应参与读出
+
+### 12.4 输入投影
+
+对每个语义节点，读出器构造：
+
+$$
+x_i = W_{abs}[s_i; \log(w_i)]
+$$
+
+映射到 d_ssm 维空间。
+
+### 12.5 树状 SSM 递推
+
+给定父节点隐藏状态 $h_{par(i)}$，当前节点执行：
+
+$$
+\Delta_i = \operatorname{softplus}(W_\Delta x_i) \odot \sigma(W_w \log w_i)
+$$
+
+$$
+\bar{A}_i = \exp(\Delta_i A)
+$$
+
+$$
+h_i = \bar{A}_i \odot h_{par(i)} + \bar{B}_i \odot x_i
+$$
+
+$$
+y_i = C(x_i)^\top h_i + D \odot x_i
+$$
+
+### 12.6 输出语义
+
+输出为 BFS 顺序上的语义节点表示矩阵：
+
+$$
+Y \in \mathbb{R}^{N_{sem} \times d_{ssm}}
+$$
+
+在当前适配器主路径中，真正使用的是：
+
+$$
+m_{ctx} = Y[-1]
+$$
+
+即最后一个 BFS 语义节点作为当前记忆向量。
+
+---
+
+## 13. 语义提升：MLPElevation 与树操作
+
+### 13.1 模块组成
+
+相关实现位于：
+
+- dual_tree_vla/model/memory_tree/operations.py
+- dual_tree_vla/model/memory_tree/tree.py
+
+### 13.2 语义提升的意义
+
+HMT 不应只是把所有历史帧当作链表堆起来，而应在边界处把多个低层片段压缩成高层语义节点。这个压缩过程由 MLPElevation 负责。
+
+### 13.3 当前代码中的主要操作
+
+树操作主要包括：
+
+- merge
+- branch
+- semantic_elevation
+- propagate_elevation_to_root
+
+### 13.4 Merge
+
+当当前片段被判定为延续已有活动叶子时，系统会对叶节点的：
+
+- z_v
+- a_hist
+- w
+
+做增量更新。
+
+### 13.5 Branch
+
+当 JumpAwareHead 判断出现边界时，系统创建新叶子节点，并准备触发语义提升。
+
+### 13.6 Elevation
+
+对于某个待提升父节点，MLPElevation 把其子节点的语义组合成新的抽象节点表示：
+
+$$
+s_{parent} = \operatorname{MLPElevation}(\text{child semantics})
+$$
+
+再向根方向传播，形成层级抽象。
+
+### 13.7 当前实现中的设备桥接
+
+树节点的长期存储张量通常保留在 CPU 侧，而 mlp_elev 权重位于训练设备上。因此适配器中专门实现了 _mlp_elev_cpu()，用于：
+
+- 把 CPU tensor 移到 mlp_elev 所在设备
+- 前向后再 .detach().cpu() 回到树中存储
+
+这是一个很典型、也很容易在论文中被忽略的工程点：树结构本身是在线状态容器，而不是简单的 GPU 全驻留张量图。
+
+---
+
+## 14. 跳变检测：JumpAwareHead
+
+### 14.1 模块位置
+
+dual_tree_vla/model/action_head/jump_aware_head.py
+
+这个文件本身只是导出封装，实际实现位于：
+
+- dual_tree_vla/model/common/semantic_jump_head.py
+
+### 14.2 输入
+
+JumpAwareHead 只消费动作，不直接看视觉或文本：
+
+- A_act：活动节点动作历史
+- a_new：当前动作
+
+### 14.3 结构
+
+它是一个基于 Mamba/SSM 思想的轻量动作序列编码器。相比把边界检测建立在视觉或语言上，这样做有两个好处：
+
+1. 边界信号更接近执行控制本身
+2. 模块可以跨视觉骨架复用
+
+### 14.4 输出
+
+输出：
+
+- p_jump
+- logit
+
+其中：
+
+$$
+p_{jump} = \sigma(\text{logit})
+$$
+
+在当前预训练路径里，force_branch 通常由是否超过阈值来决定。
+
+### 14.5 边界监督
+
+当前代码同时支持两类边界标签来源：
+
+1. 若给定 subtask_ids，则相邻帧子任务 ID 变化处为边界
+2. 否则退化为基于动作统计的自监督边界标签
+
+这使 RoboCerebra 既可以用显式步骤标注，也可以在弱监督下训练。
+
+---
+
+## 15. 动作生成：FlowMatchingActionHead
+
+### 15.1 模块位置
+
+dual_tree_vla/model/action_head/flow_matching.py
+
+### 15.2 架构定位
+
+这是一个条件流匹配动作生成头。相比直接回归动作，它学习的是把噪声轨迹输运到动作轨迹的速度场。
+
+### 15.3 输入与输出
+
+输入：
+
+- a_noisy：噪声或插值动作序列
+- t：时间标量
+- ctx：上下文 token 序列
+
+输出：
+
+- v_theta(a_t, t, ctx)
+
+### 15.4 内部结构
+
+该动作头由以下部分组成：
+
+1. 动作投影层 a_in
+2. 位置嵌入 pos_emb
+3. 时间嵌入 TimestepEmbedding
+4. 多层 FlowBlock
+5. 输出层 out_proj
+
+每个 FlowBlock 包含：
+
+- 因果 self-attention
+- 对上下文 token 的 cross-attention
+- FFN
+- 由时间嵌入生成的 AdaLN 调制参数
+
+### 15.5 当前默认超参数
+
+在当前实现中，默认是：
+
+- d_model = 256
+- n_layers = 4
+- n_heads = 8
+- H_a = 16
+- N_ode = 20
+
+这与 Evo-1 的某些更大配置不同，属于当前仓库实际实现而非概念配置。
+
+### 15.6 训练损失
+
+flow_loss() 中的采样机制为：
+
+1. 采样时间：
+
+$$
+u \sim \mathcal{N}(0,1), \quad t = \sigma(u)
+$$
+
+2. 采样噪声：
+
+$$
+a_0 \sim \mathcal{N}(0,I)
+$$
+
+3. 插值：
+
+$$
+a_t = (1-t)a_0 + ta_{gt}
+$$
+
+4. 目标速度：
+
+$$
+v^* = a_{gt} - a_0
+$$
+
+5. 优化：
+
+$$
+\mathcal{L}_{flow} = \mathbb{E}\|v_\theta(a_t, t, ctx) - v^*\|_2^2
+$$
+
+### 15.7 推理
+
+推理时从高斯噪声开始，进行 Euler 积分：
+
+$$
+a_{t+\Delta t} = a_t + \Delta t \cdot v_\theta(a_t, t, ctx)
+$$
+
+当前默认积分步数为 N_ode = 20。
+
+---
+
+## 16. 遗留设计路径：policy/CrossModalFusion 分支
+
+### 16.1 为什么这部分仍要保留在文档里
+
+因为仓库中确实存在：
+
+- dual_tree_vla/policy/dual_tree_policy.py
+- dual_tree_vla/model/common/fusion.py
+
+并且它们表达了更标准的“视觉-记忆-语言-状态”融合设计。
+
+### 16.2 CrossModalFusion 的数学形式
+
+给定：
+
+- z_v
+- m_ctx
+- g_lang
+- q
+
+代码实现的是：
+
+$$
+g = \sigma(W_g[z_v; m_{ctx}; q; g_{lang}])
+$$
+
+$$
+f_1 = W_1[z_v; m_{ctx}], \qquad f_2 = W_2[q; g_{lang}]
+$$
+
+$$
+f_{fused} = g \odot f_1 + (1-g) \odot f_2
+$$
+
+最后输出 (B, 1, d) 形式的单 token 上下文。
+
+### 16.3 它与当前主路径的关系
+
+当前主路径没有把 CrossModalFusion 接到训练主循环中，但它代表了仓库更完整的设计意图：
+
+- 视觉树读出
+- 记忆树读出
+- 语言语义
+- 本体感知状态
+
+统一融合后再驱动动作头。
+
+### 16.4 论文中如何处理
+
+若论文要写“完整架构设计”，可以把 CrossModalFusion 写成：
+
+- 仓库中实现并保留的跨模态融合层
+- 当前主实验代码尚未把它作为唯一主路径接入
+
+这种写法真实且可辩护，优于把它直接写成“当前所有实验都严格使用”的主链路。
+
+---
+
+## 17. 数据集与数据加载
+
+## 17.1 RoboCerebra 训练集
+
+目录结构：
+
+```text
+data/RoboCerebra/RoboCerebra_trainset/
+    coffee_table/
+    kitchen_table/
+    study_table/
+        caseN/
+            demo.hdf5
+            caseN.mp4
+            task_description.json
 ```
-叶子节点（is_leaf() == True）
-────────────────────────────
-  z_v    : (d,)       视觉嵌入（Welford 在线均值）
-  a_hist : List[d_a]  动作历史（供 JumpAwareHead 使用）
-  w      : float      节点权重
 
-抽象节点（由 MLPElevation 创建，is_leaf() == False）
-────────────────────────────────────────────────────
-  s      : (d,)   语义嵌入（MLPElevation 的输出）
-  w      : float  节点权重
+加载器：dual_tree_vla/dataset/robocerebra.py
+
+### 17.1.1 HDF5 内容
+
+每个 demo.hdf5 下可能包含多个 demo_x，每个 demo 被视作一条独立轨迹。加载器读取：
+
+- actions
+- states
+
+### 17.1.2 视频帧
+
+若未启用特征缓存，则从 mp4 中按 subsample 提取帧并 resize 到配置尺寸。
+
+### 17.1.3 子任务标注
+
+task_description.json 中包含：
+
+- 高层任务描述
+- 每个步骤的自然语言子任务描述
+- 起止时间戳
+
+加载器会把它转换成：
+
+- instruction
+- subtask_ids
+- subtask_descs
+
+### 17.1.4 边界 mask
+
+加载器还会生成基于动作统计的 boundary_mask，供预训练评估或弱监督使用。
+
+### 17.1.5 预提取特征缓存
+
+若设置 feat_cache_dir，加载器优先读取缓存特征：
+
+- P_t_raw
+- z_v_feat
+
+这样预训练可以跳过重复的 ViT 前向。
+
+## 17.2 RoboCerebraBench
+
+目录结构：
+
+```text
+data/RoboCerebra/RoboCerebraBench/
+    Ideal/
+    Memory_Execution/
+    Memory_Exploration/
+    Mix/
+    Observation_Mismatching/
+    Random_Disturbance/
 ```
 
-**树初始化**（第一帧）：第一帧无论 JumpAwareHead 输出何值，均视为跳变点，直接建立两层结构：
+加载器：dual_tree_vla/dataset/robocerebra_bench.py
 
-```
-[abs_root (s = s_cur_frame1)]  ← 抽象根（语义探针）
-    └── [leaf_0]               ← 第一帧叶子，active_id
-```
+每个 case 下包含：
 
-`elevation_pending_parent = abs_root_id`，`propagate_elevation_to_root` 随即用 `leaf_0.z_v` 更新 `abs_root.s`。此后树中始终存在至少一层抽象节点，`_branch_split` 无需处理零抽象层特殊情况。
+- demo.hdf5
+- caseN.mp4
+- task_description.txt
+- goal.json
+- *.bddl
+- 可选 distractor 信息
 
-**三种决策**（每帧 forward 时执行）：
+该数据集用于离线评测，不需要仿真器。
 
-| 决策 | 触发条件 | 操作 |
-|------|---------|------|
-| 合并（Merge） | `force_branch=False`（JumpAwareHead 判定） | Welford 更新活跃叶子的 `z_v`，追加 `a_hist` |
-| 分支（Branch） | `force_branch=True`（JumpAwareHead 判定） | 语义爬升找挂载点 → 创建新叶子；**立即触发 Elevate** |
-| 提升（Elevate） | Branch 后立即执行（无数量阈值） | 对挂载点的叶子子节点加权池化 `z_v`，MLPElevation → 插入抽象父节点 `s_abs` |
+## 17.3 LIBERO
+
+当前扫描到的 LIBERO 子集包括：
+
+- libero_10
+- libero_spatial
+- libero_object
+- libero_goal
+
+加载器：dual_tree_vla/dataset/libero.py
+
+### 17.3.1 支持三种布局
+
+LIBERO 加载器支持：
+
+1. Layout A：自定义 inline bytes parquet
+2. Layout B：LeRobot v2，parquet + mp4
+3. Layout C：LeRobot v3，chunked parquet
+
+### 17.3.2 当前 libero_10 的元数据
+
+根据 data/libero/libero_10/meta/info.json：
+
+- total_episodes = 379
+- total_frames = 101469
+- total_tasks = 10
+- fps = 10
+- 图像有两路：image 与 wrist_image
+- 状态维度 8
+- 动作维度 7
+
+### 17.3.3 step-level 训练
+
+LiberoDataset 默认在训练中使用：
+
+- step_level = True
+
+这意味着：
+
+- 每个样本对应一帧观察
+- 标签是从该帧开始的未来 H_a 步动作 chunk
+- 整个 epoch 会枚举所有可用起始帧，而不是只取每条轨迹前 120 帧
+
+因此当前训练已经是全量帧训练，不存在“只训练前 120 帧”的逻辑。120 只出现在可视化函数里。
+
+### 17.3.4 缓存机制
+
+为了避免反复解码整条视频，LIBERO 加载器采用：
+
+- 以 episode 为粒度的 LRU cache
+- 训练时 step-level 只解码当前一帧 JPEG
+- episode-level 模式才会解码整条轨迹
+
+这部分是训练速度能否接受的关键工程手段之一。
 
 ---
 
-#### Branch 事件完整流程（语义感知分支挂载 — 3种情况）
+## 18. 训练流程
 
-当 JumpAwareHead 判定当前帧为语义跳变时（`force_branch=True`），分支操作分为 **4个步骤** 顺序执行：
+### 18.1 Stage 0：预训练
 
----
+入口：pretrain.py
 
-##### 步骤 1：提取当前帧的语义探针
+目标：
 
-对当前帧视觉嵌入 $z_v^\text{cur}$ 通过 MLPElevation 提取一个**临时语义探针**：
+- 学会动作边界检测
+- 学会视觉语义对齐
+- 学会抽象节点提升
 
-$$s_\text{cur} = \text{MLPElevation}(z_v^\text{cur}) \in \mathbb{R}^d$$
+冻结模块：
 
-$s_\text{cur}$ 是单帧的粗略语义估计，**仅用于本次挂载位置决策，不存入任何节点**（以 `detach().cpu()` 处理，不参与梯度）。
+- ViT
+- LLM
+- MLP projector
+- FlowMatchingActionHead
 
----
+可训练模块：
 
-##### 步骤 2：语义爬升 + 分类（`tree._classify_mount`）
+- SGMTS
+- GateFusion
+- sem_proj
+- JumpAwareHead
+- TreeSSMReadout
+- MLPElevation
+- mem_proj
 
-从活跃叶子的**第一抽象祖先**（`active_leaf.parent_id`，最低语义节点）开始，沿父链向上逐节点计算：
+损失：
 
-$$d_k = 1 - \cos(s_\text{cur},\, s_k)$$
+$$
+\mathcal{L}_{pretrain} = w_b \mathcal{L}_{boundary} + w_s \mathcal{L}_{sem} + w_e \mathcal{L}_{elev}
+$$
 
-根据爬升结果，分为 **3种情况（Case A / B / C）**：
+默认权重来自 pretrain.yaml：
 
-| 情况 | 触发条件 | 描述 |
-|------|---------|------|
-| **Case A**（最低满足） | 第一个抽象节点即 $d_\text{first} < \tau_\text{mount}$ | s_cur 与该子任务差异足够小（相似度高），直接挂叶子，无需插入中间层 |
-| **Case B**（中间满足） | $d_\text{first} \geq \tau_\text{mount}$，爬升中某节点 $v_k$ 满足 $d_k < \tau_\text{mount}$ | s_cur 语义层级高于最低抽象节点，需在 $v_k$ 下新建语义探针抽象层 |
-| **Case C**（超出根节点） | 爬升至根仍无 $d_k < \tau_\text{mount}$ | s_cur 与树中所有层级差异都大，需创建超级根来容纳 |
+- w_boundary = 1.0
+- w_sem = 0.5
+- w_elev = 0.2
 
-> **核心直觉**：
-> - **Case A**："第一抽象层差异已足够小"→ 说明新子任务和最低抽象节点属于同一语义层级，可直接挂在该节点下，**不需要新建中间层**
-> - **Case B**："需要爬升才能找到相似祖先" → 说明新子任务语义层级高于最低抽象节点，在差异足够小的祖先 $v_k$ 下**新建语义探针抽象节点**来表示这个分支
-> - **Case C**："爬升至根差异仍大" → 说明新子任务与树中所有层级语义差异都大，是与根并列的全新子任务，需要**创建超级根**来统一容纳
+### 18.2 Phase 1：FlowMatching warm-up
 
----
+入口：train.py --phase 1
 
-##### 步骤 3：挂载（3种路径）
+当前真实可训练模块为：
 
-**Case A — 直接挂叶子（1层新增）**：
+- SGMTS
+- GateFusion
+- mem_proj
+- backbone.action_head
 
-```
-[first_abstract (已有)]
-    ├── [active_leaf (已有)]
-    └── [new_leaf]  ← NEW，active_id 切换至此
-```
+也就是说，当前代码中的 Phase 1 注释与早期文档存在差异：不是“只训练 CrossModalFusion + ActionHead”，而是走适配器当前真实 L_flow 路径所需模块。
 
-`elevation_pending_parent = first_abstract_id`
+损失只有：
 
----
+$$
+\mathcal{L}_{flow}
+$$
 
-**Case B — 插入语义探针层，再挂叶子（2层新增）**：
+### 18.3 Phase 2：全量微调
 
-在 $v_k$ 下先插入**语义探针抽象节点**（$s = s_\text{cur}$），再在其下挂叶子：
+入口：train.py --phase 2
 
-```
-[v_k (已有)]
-    ├── ... (已有子树，含 active_leaf 分支)
-    └── [probe_abstract (s = s_cur)]  ← NEW，代表新子任务分支
-             └── [new_leaf]           ← NEW，active_id 切换至此
-```
+策略：
 
-`elevation_pending_parent = probe_abstract_id`
+- 先冻结全部参数
+- 解冻双树模块
+- 只解冻 language model
+- ViT 和 mlp1 保持冻结
 
----
+并且 language model 使用 0.1 倍学习率。
 
-**Case C — 创建超级根 + 语义探针层（2层新增，共3层结构变化）**：
+### 18.4 优化器与调度器
 
-创建超级根，旧根挂其下；再在超级根下新建**语义探针抽象节点**（$s = s_\text{cur}$），新叶挂探针下：
+训练脚本使用：
 
-```
-[super_root (s ← propagate 更新)]  ← NEW，成为新 root_id
-    ├── [old_root (原整棵树)]
-    └── [probe_abstract (s = s_cur)]  ← NEW，代表新高层语义分支
-             └── [new_leaf]           ← NEW，active_id 切换至此
-```
+- AdamW
+- cosine decay with linear warmup
 
-`elevation_pending_parent = probe_abstract_id`
+近期修复点：
 
-> 超级根的 $s$ 在 `propagate_elevation_to_root` 时由 `MLPElevation(pool(old_root.s, probe.s))` 自动得到，相当于将 $s_\text{cur}$ 与旧根语义"融合"出更高层次的概括。与 Case B 同理：探针节点初始持有 $s_\text{cur}$，由 propagate 使用已更新的子层嵌入重算覆盖。
+- scheduler.step() 只在真实 optimizer.step() 发生时执行
+- 避免了梯度累积时学习率调度错误加速的问题
 
----
+### 18.5 DDP 与 DeepSpeed 状态
 
-##### 步骤 4：全路径语义更新（`propagate_elevation_to_root`）
+当前仓库内有：
 
-**只要发生挂载操作**，就从 `elevation_pending_parent` 开始，沿父链向上逐节点更新每个抽象节点的 $s$，**直至根节点**：
+- dual_tree_vla/config/deepspeed/ds_zero2.json
+- dual_tree_vla/config/deepspeed/ds_zero3.json
 
-$$s_{\text{node}} \leftarrow \text{MLPElevation}\!\left(\frac{\displaystyle\sum_{i \in \text{直接子节点}} w_i\, e_i}{\displaystyle\sum_i w_i}\right)$$
+但是否真正启用取决于启动命令。当前 Python 训练入口本身没有直接构造 deepspeed_plugin，所以 DeepSpeed 是“配置文件已存在，但需由外部启动方式显式接入”的状态。
 
-其中子节点嵌入 $e_i$ 按类型取值：
-- 叶子子节点 → 用 $z_v$
-- 抽象子节点 → 用其 $s$（已被本轮下层更新）
+### 18.6 当前已做的性能修复
 
-**自下而上**确保每层使用最新子层语义。这样每次分支后整棵树所有祖先的语义概括都保持最新，下次 Case B 爬升时的比较结果不会过期。
+为解决训练过慢，当前主路径已经做了三项关键修复：
 
-> **提升频率设计**：只有分支（Branch）时才触发全路径更新，合并（Merge）时不更新。Merge 阶段叶子的 $z_v$ 通过 Welford 在线均值逐渐稳定；当下次分支发生时，`propagate` 才用这些稳定后的 $z_v$ 更新祖先 $s$。这避免了每帧都做 MLPElevation 的高昂代价，同时保证分支决策时语义是最新的。
+1. Phase 1/2 引入批量 VLM 前向 _embed_batch_flow()
+2. DDP 中关闭 find_unused_parameters=True
+3. 默认把训练可视化频率从每个 epoch 调整为每 5 个 epoch 一次
 
----
-
-##### 步骤 5：深度剪枝（`tree._prune_to_max_depth(max_depth=4)`）
-
-全路径更新完成后，立即检查树的深度。若存在深度 $> 4$ 的节点（根节点深度 = 0），从最深层向上依次删除：
-
-$$\text{有效树深度} \leq 4 \quad (\text{支持最多 4 层语义粒度})$$
-
-> 受 Case B 和 Case C 的影响，树会在纵向上增长（Case B 在中间插入一层，Case C 增加一层超级根）。树倾向于**左侧（旧记忆）积累更大深度**，剪枝相当于遗忘久远的历史——这与人类工作记忆的衰减规律一致。剪枝后若 active_id 被删除，切换至最右叶子（最新记忆）。
+这些修复对训练吞吐影响显著，属于论文复现实验应记录的工程配置差异。
 
 ---
 
-**超参数**：
+## 19. 评估与可视化流程
 
-| 参数 | 默认值 | 含义 |
-|------|-------|------|
-| `mount_tau` | 0.4 | 余弦距离阈值；小 → 更难触发 Case A（差异阈值严苛）→ 树倾向 Case B/C（更深）；大 → 树更扁平 |
-| `max_tree_depth` | 4 | 最大树深度；超出则剪枝旧记忆节点 |
+### 19.1 离线评估
 
-均在 `configs/default.yaml` 中配置。
+入口：eval.py
 
-**TreeSSMReadout**：沿 HMT BFS 顺序仅对**语义节点**（`node.s is not None`）执行 SSM 扫描，原始帧叶子节点（仅有 `z_v`/`a_hist`，无 `s`）不参与 Readout：
+支持三类数据集：
 
-> **设计动机**：叶子节点存储的是原始视觉嵌入 $z_v$ 和动作历史 $a_\text{hist}$，其语义信息已在 Elevate 阶段由 MLPElevation 归纳压缩进父语义节点的 $s$ 中。对原始帧节点再做 SSM 扫描是冗余的，且会引入噪声帧级细节。
->
-> **注意**：剪枝后，语义节点可能因子节点全部被删而变为 `is_leaf()==True`，但它仍持有语义嵌入 $s$，代表已完成的子任务记忆，**仍需参与 Readout**。因此判断标准为 `node.s is not None`，而非 `not is_leaf()`。
+- robocerebra
+- robocerebra_bench
+- libero
 
-$$m_\text{ctx} = \text{SSM}_\text{Tree}\bigl(\{x_i\}_{i \in \text{BFS-abstract}}\bigr)[-1] \in \mathbb{R}^{d_\text{ssm}}$$
+评估指标包括：
 
-$$x_i = W_\text{abs}\bigl[s^{(i)};\ \log w_i\bigr], \quad i \in \{\text{抽象节点}\}$$
+- action_l1
+- action_l2
+- tree_nodes
+- tree_depth
+- tree_branches
+- tree_elevations
+- subtask_boundary_f1
+- prog_monotone_rate
+- subtask_sr
 
-抽象节点的父节点也必然是抽象节点（或 None=根），父子链在抽象层级内自洽，SSM 递推 $(h_i = \bar{A}_i \odot h_{\text{par}(i)} + \bar{B}_i \odot x_i)$ 直接在抽象节点间进行。
+### 19.2 预训练可视化
 
-**MLPElevation**：只接收子叶子节点 `z_v` 加权池化，输出抽象节点语义嵌入：
+pretrain.py 中集成了 _run_pretrain_eval()，但默认 eval_every=999，即训练中几乎不自动执行。主要可视化入口是：
 
-$$z_\text{pool} = \frac{\sum_i w_i\, z_v^{(i)}}{\sum_i w_i}, \qquad s_\text{abs} = \text{MLP}(z_\text{pool}) \in \mathbb{R}^d$$
+- scripts/pretrain_eval.py
 
-### 3.4 CrossModalFusion（跨模态融合）
+它会输出：
 
-**文件**: `dual_tree_vla/model/fusion.py`
+- 树 JSON
+- 视觉树语义重要性热力图
 
-将视觉特征 $z_v$、记忆上下文 $m_\text{ctx}$、本体感知状态 $q$ 和语言嵌入 $g_\text{lang}$ 融合。
+### 19.3 训练中视频可视化
 
-#### 门控融合公式
+train.py 中的 visualize_epoch() 会生成：
 
-$$g = \sigma\!\bigl(W_g\,[z_v;\, m_\text{ctx};\, q;\, g_\text{lang}] + b_g\bigr) \in [0,1]^d$$
+- GT vs Pred 对比视频
 
-$$f_\text{fused} = g \odot W_1[z_v;\, m_\text{ctx}] + (1-g) \odot W_2[q;\, g_\text{lang}] \in \mathbb{R}^d$$
+注意：这个函数默认只截取 viz_max_frames 帧，不影响训练样本覆盖率，只影响日志视频长度。
 
-Phase 1 开始时该模块处于随机初始化状态，Phase 1 专门训练它。
+### 19.4 WebSocket 在线评估
 
-### 3.5 FlowMatchingActionHead（流匹配动作头）
+仓库还提供 server/client 评估链路：
 
-**文件**: `dual_tree_vla/model/action_head/flow_matching.py`
+- scripts/eval_server.py
+- scripts/eval_client.py
 
-基于连续归一化流（Flow Matching）的动作生成头，输入 $f_\text{fused}$ 生成 $H_a$ 步动作序列。
+其作用是：
 
-#### Flow Matching 训练目标
+- 在服务端加载模型并保留 GPU
+- 客户端驱动 LIBERO 仿真环境
+- 二者通过 WebSocket 交互观测和动作块
+- 当前 `scripts/eval_server.py` 提供 argparse 入口；`scripts/eval_client.py` 仍通过顶部 `Args` 类配置运行参数，而不是命令行参数
 
-定义线性插值轨迹（$x_0 \sim \mathcal{N}(0,I)$，$x_1 = a_\text{gt}$）：
+### 19.5 图像翻转与 gripper 阈值
 
-$$x_t = (1-t)\,x_0 + t\,x_1, \quad t \sim \mathcal{U}[0,1]$$
+这一部分在当前仓库中仍是重要实现细节：
 
-目标速度场（与路径无关的常数场）：
+- eval_client.py 当前对 agentview_image 和 wrist_image 都使用 [::-1, ::-1]，即旋转 180 度
+- 这已经与当前 Evo1 对照实现保持一致
 
-$$u_t(x_t) = x_1 - x_0$$
+gripper 二值化方面：
 
-模型预测速度 $v_\theta(x_t,\, t,\, f_\text{fused})$，训练损失：
+- 当前客户端使用阈值 0.0
+- 这是基于 z-score 反归一化后的动作空间假设
 
-$$\mathcal{L}_\text{flow} = \mathbb{E}_{t,\,x_0,\,x_1}\;\bigl\|v_\theta(x_t,\, t,\, f_\text{fused}) - (x_1 - x_0)\bigr\|_2^2$$
-
-推理时以 $x_0 \sim \mathcal{N}(0,I)$ 为起点，用 Euler 法积分 `n_ode` 步：
-
-$$x_{t+\Delta t} = x_t + \Delta t\cdot v_\theta(x_t,\, t,\, f_\text{fused}), \qquad \hat{a} = x_1$$
-
----
-
-## 4. 两阶段训练流程
-
-```
-        预训练阶段                           LIBERO                LIBERO
-   （RoboCerebra 全模型）        →      Phase 1         →     Phase 2
-─────────────────────────────────     ─────────────         ──────────────
-RoboCerebra                           冻结: LLM +           冻结: 无
-  · 冻结: LLM, Fusion, FlowHead             全部预训练模块
-  · 可训练: SGMTS(adapter), s_proj,                        可训练: 全部
-    JumpAwareHead,                     可训练: Fusion,            (LLM: 0.1× LR)
-    TreeSSM, MLPElevation                      FlowHead
-  · 损失: L_boundary                   损失: L_flow          损失: L_flow
-    + L_sem                               （仅此一项）            （仅此一项）
-
-脚本: scripts/pretrain.py             脚本: scripts/train.py --phase 1/2
-配置: configs/pretrain.yaml           配置: configs/train_phase1/2.yaml
-```
-
-### 阶段说明
-
-#### 全模型预训练（RoboCerebra）
-
-目标：让模型学会"什么是子任务边界"以及"边界处的语义应当与子任务描述对齐"。
-
-- 视觉骨干（CLIP ViT）完全冻结，仅训练 SGMTS 中的轻量 adapter（Linear + LayerNorm）
-- `JumpAwareHead` 学习从动作序列中识别动作突变点（纯动作信号，不依赖语义）
-- `SGMTS` adapter 学习将 CLIP 特征映射到本项目的内部维度 `d_f`，使 MST 边权适配任务语义
-- `MLPElevation` 学习将子节点语义归纳为抽象父节点语义
-- `L_sem` 验证"分支时刻的视觉嵌入是否接近子任务文本描述"（此时 LLM 冻结，语义空间稳定）
-
-#### Phase 1（LIBERO，LLM 冻结）
-
-目标：让 FlowMatchingActionHead 和 CrossModalFusion 学会利用已有的记忆树来预测动作。
-
-- 从 `pretrain_best.pt` 加载预训练权重，冻结全部预训练模块
-- 只优化 Fusion + FlowHead，损失仅 L_flow
-- 避免预训练阶段建立的语义结构被破坏
-
-#### Phase 2（LIBERO，全量微调）
-
-目标：全模型端到端微调，进一步提升动作质量。
-
-- 解冻全部参数，LLM 使用 0.1× 学习率（防止灾难性遗忘）
-- 损失仅 L_flow
-- 继续不引入语义损失（语义结构已在预训练确立）
+这两点在真实仿真成功率上都可能产生显著影响，论文实验需要固定说明。
 
 ---
 
-## 5. 核心设计原则：损失函数完全分离
+## 20. 配置系统与关键超参数
 
-> **最重要的设计约束**：语义相关损失与 FlowMatching 损失不能混合在同一训练阶段。
+### 20.1 配置文件
 
-```
-全模型预训练（RoboCerebra）   →  L_boundary + L_sem
-第一阶段训练（LIBERO）        →  L_flow  ← 仅此一项
-第二阶段训练（LIBERO）        →  L_flow  ← 仅此一项
-```
+当前主要配置文件为：
 
-> **关于 CLIP 预训练**：CLIP Vision Encoder 的权重在整个训练流程中保持冻结，无需任何分类损失（已弃用的 L_cls 已从项目中移除）。CLIP 的语义能力来自其自身的预训练，与本项目的两个损失函数完全解耦。
----
+- dual_tree_vla/config/pretrain.yaml
+- dual_tree_vla/config/train_phase1.yaml
+- dual_tree_vla/config/train_phase2.yaml
+- dual_tree_vla/config/default.yaml
 
-## 6. 损失函数详解
+### 20.2 关键模型维度
 
-**文件**: `dual_tree_vla/losses/tree_losses.py`
+当前主路径常用关键超参数：
 
-### 6.1 预训练损失
+- d_vit = 896
+- d_ssm = 256
+- d_state = 16
+- d_a = 7
+- H_a = 16
+- n_ode = 20 或配置中指定值
+- mount_tau = 0.4
+- alpha = 0.5
+- delta_w = 0.1
+- max_tree_depth = 4
 
-#### `l_boundary` — 动作突变边界 BCE
+### 20.3 LIBERO 数据配置
 
-$$\mathcal{L}_\text{boundary} = -\sum_t \Bigl[r\,y_t\log\sigma(\ell_t) + (1-y_t)\log(1-\sigma(\ell_t))\Bigr]$$
+根据 train_phase1.yaml：
 
-其中 $r = n_\text{neg}/n_\text{pos}$ 为正样本重加权因子，$\ell_t$ 为 JumpAwareHead 输出 logit，自监督标签：
+- root = data/libero/libero_10
+- img_h = img_w = 224
+- d_q = 8
+- normalize = true
 
-$$y_t = \mathbf{1}\bigl[\|a_t - \bar{a}_\text{act}\| > \gamma\,\sigma_\text{act}\bigr]$$
+### 20.4 RoboCerebra 数据配置
 
-#### `l_sem` — 分支点语义对齐 InfoNCE
+根据 pretrain.yaml：
 
-$$\mathcal{L}_\text{sem} = -\frac{1}{N}\sum_{i=1}^N \log \frac{\exp(s_i^\top s_i^\text{text} / \tau)}{\sum_{j=1}^N \exp(s_i^\top s_j^\text{text} / \tau)}$$
+- subsample = 4
+- max_seqlen = 1400
+- img_h = img_w = 224
 
-- $s_i \in \mathbb{R}^d$：分支点时刻的视觉语义嵌入（SGMTS 输出）
-- $s_i^\text{text} \in \mathbb{R}^d$：对应真实子任务描述的语言嵌入（LLM 编码，冻结）
-- $\tau = 0.07$：InfoNCE 温度
+### 20.5 训练超参数概览
 
-#### 预训练总损失
+预训练默认：
 
-$$\mathcal{L}_\text{pretrain} = w_b\,\mathcal{L}_\text{boundary} + w_s\,\mathcal{L}_\text{sem}$$
+- batch_size = 2
+- epochs = 30
+- lr = 3e-4
 
-默认权重：$w_b = 1.0,\; w_s = 0.5$
+Phase 1 默认：
 
-### 6.2 Phase 1/2 损失
+- batch_size = 8
+- grad_accum = 2
+- lr = 1e-4
 
-Phase 1 和 Phase 2 **只使用 $\mathcal{L}_\text{flow}$**，由 `FlowMatchingActionHead.forward()` 内部计算并返回：
+Phase 2 默认：
 
-$$\mathcal{L}_\text{flow} = \mathbb{E}_{t,x_0,x_1}\;\bigl\|v_\theta(x_t,\, t,\, f_\text{fused}) - (x_1 - x_0)\bigr\|_2^2$$
-
-```python
-{"L_flow": <tensor>, "total": <tensor>}   # total == L_flow
-```
-
-没有任何语义或树结构相关损失混入。
-
----
-
-## 7. 模型 Forward API
-
-```python
-losses = model(
-    images,        # (B, T, C, H, W)  — 原始 RGB 帧序列
-    instructions,  # List[str] len=B   — 任务自然语言描述
-    states,        # (B, T, d_q)       — 本体感知状态序列（关节角等）
-    actions,       # (B, T, d_a)       — 专家动作序列（训练时提供）
-    subtask_ids,   # (B, T) optional   — 子任务 ID（预训练时需要）
-    mode,          # 'pretrain' | 'phase1' | 'phase2'
-)
-```
-
-### 返回值约定
-
-| `mode` | 返回 dict 的键 | 实际计算的损失 |
-|--------|--------------|--------------|
-| `'pretrain'` | `L_boundary`, `L_sem`, `total` | $\mathcal{L}_b + \mathcal{L}_s$ |
-| `'phase1'` | `L_flow`, `total` | $\mathcal{L}_\text{flow}$ only |
-| `'phase2'` | `L_flow`, `total` | $\mathcal{L}_\text{flow}$ only |
+- batch_size = 8
+- lr = 3e-5 级别
+- language model 使用 0.1 倍学习率
 
 ---
 
-## 8. 项目文件结构
+## 21. 工程实现细节与性能注意事项
 
+### 21.1 依赖现状
+
+requirements.txt 中声明：
+
+- torch
+- torchvision
+- transformers
+- accelerate
+- timm
+- deepspeed
+- opencv-python
+- h5py
+- wandb
+- websockets
+
+并明确写明：
+
+- flash-attn 为可选项，建议单独安装
+
+### 21.2 Flash Attention
+
+仓库在三个层面支持 Flash Attention：
+
+1. InternVL3 加载时 use_flash_attn=True
+2. FlashMHA 中优先尝试 flash_attn 包
+3. 若不可用，则回退到 PyTorch SDPA
+
+### 21.3 DeepSpeed
+
+仓库包含：
+
+- ZeRO-2 配置
+- ZeRO-3 配置
+
+但当前主入口不会自动启用，需要外部脚本或启动命令正确传入 accelerate/deepspeed 配置。
+
+### 21.4 tokenizer 并行
+
+训练脚本显式设置：
+
+```text
+TOKENIZERS_PARALLELISM=false
 ```
+
+这是为了减少多进程日志污染和并发不可控行为。
+
+### 21.5 mixed precision
+
+当前主训练默认使用：
+
+- bf16
+
+这也是当前 A6000/Ampere 平台上较合理的默认选择。
+
+---
+
+## 22. 论文撰写时必须注明的实现事实
+
+以下事实如果不写清楚，会导致论文描述与代码实现失配：
+
+### 22.1 当前主实验路径不是旧版 CrossModalFusion 主链路
+
+主训练和主推理依赖 DualTreeAdapter_Evo1，而不是 policy/DualTreeVLA。
+
+### 22.2 当前视觉树直接消费骨架 ViT patch，而不是独立 CLIP 主干
+
+旧文档和历史状态里曾出现 CLIP 版叙述，但当前主实现已经转为 ViT hook 路径。
+
+### 22.3 当前动作头上下文来自 LLM 最后层序列，而不是明确的多 token 双树融合上下文块
+
+当前适配器最终传给 predict_action() 的是 fused_hidden[:,0,:]，然后在 backbone 中被扩展成 1-token context。
+
+### 22.4 HMT 在预训练中是 fully active，在 Phase 1/2 当前批量训练中并非完整逐步更新
+
+这是一个必须如实说明的系统实现现实。
+
+### 22.5 LIBERO 训练是全量 step-level，而不是固定长度片段前 120 帧
+
+120 帧仅用于视频可视化。
+
+### 22.6 当前仓库同时包含“现实现”和“重构目标”
+
+REFACTOR_PLAN.md 和 policy/ 提供了更理想化的结构目标，但论文结果若基于当前训练脚本，应以 adapter/backbone 主路径为准。
+
+---
+
+## 23. 当前项目文件结构说明
+
+下面给出面向当前实现的结构化说明。
+
+```text
 DualTreeVLA/
-├── CONSTRUCTION.md              ← 本文档
+├── CONSTRUCTION.md
 ├── README.md
+├── REFACTOR_PLAN.md
+├── pretrain.py
+├── train.py
+├── eval.py
 ├── requirements.txt
+├── setup.py
 │
-├── configs/
-│   ├── pretrain.yaml            ← 预训练配置（L_boundary+L_sem，无 L_flow）
-│   ├── train_phase1.yaml        ← Phase 1 配置（仅 L_flow，冻结 LLM）
-│   ├── train_phase2.yaml        ← Phase 2 配置（仅 L_flow，全量微调）
-│   ├── ds_zero2.json            ← DeepSpeed ZeRO-2（Phase 1 推荐）
-│   └── ds_zero3.json            ← DeepSpeed ZeRO-3（Phase 2 推荐）
+├── docs/
+│   ├── project_status.md
+│   └── evo1_analysis.md
+│
+├── dual_tree_vla/
+│   ├── __init__.py
+│   ├── adapter/
+│   │   ├── __init__.py
+│   │   ├── base_adapter.py
+│   │   └── evo1_adapter.py
+│   ├── common/
+│   │   ├── checkpoint_util.py
+│   │   ├── normalizer.py
+│   │   └── pytorch_util.py
+│   ├── config/
+│   │   ├── default.yaml
+│   │   ├── pretrain.yaml
+│   │   ├── train_phase1.yaml
+│   │   ├── train_phase2.yaml
+│   │   └── deepspeed/
+│   │       ├── ds_zero2.json
+│   │       └── ds_zero3.json
+│   ├── dataset/
+│   │   ├── __init__.py
+│   │   ├── base_dataset.py
+│   │   ├── libero.py
+│   │   ├── robocerebra.py
+│   │   └── robocerebra_bench.py
+│   ├── losses/
+│   │   ├── __init__.py
+│   │   └── tree_losses.py
+│   ├── model/
+│   │   ├── __init__.py
+│   │   ├── gate_fusion.py
+│   │   ├── action_head/
+│   │   │   ├── __init__.py
+│   │   │   ├── flow_matching.py
+│   │   │   └── jump_aware_head.py
+│   │   ├── backbone/
+│   │   │   ├── __init__.py
+│   │   │   ├── backbone.py
+│   │   │   └── internvl3_embedder.py
+│   │   ├── common/
+│   │   │   ├── __init__.py
+│   │   │   ├── attn.py
+│   │   │   ├── fusion.py
+│   │   │   └── semantic_jump_head.py
+│   │   ├── memory_tree/
+│   │   │   ├── __init__.py
+│   │   │   ├── node.py
+│   │   │   ├── operations.py
+│   │   │   ├── tree.py
+│   │   │   └── tree_ssm.py
+│   │   └── sgmts/
+│   │       ├── __init__.py
+│   │       └── sgmts.py
+│   └── policy/
+│       ├── __init__.py
+│       ├── base_policy.py
+│       └── dual_tree_policy.py
 │
 ├── scripts/
-│   ├── pretrain.py              ← 预训练脚本（RoboCerebra 全模型）
-│   ├── train.py                 ← Phase 1/2 训练脚本（LIBERO, mode='phase1'|'phase2'）
-│   ├── eval.py                  ← 评测脚本
-│   ├── pretrain.sh              ← 单机启动脚本
+│   ├── demo_robocerebra.py
+│   ├── eval_client.py
+│   ├── eval_server.py
+│   ├── extract_pretrain_features.py
+│   ├── pretrain.sh
+│   ├── pretrain_eval.py
 │   ├── train_phase1.sh
 │   └── train_phase2.sh
 │
-├── dual_tree_vla/
-│   ├── model/
-│   │   ├── dual_tree_vla.py   ← 主模型（DualTreeVLA, 两阶段 forward）
-│   │   ├── semantic_jump_head.py  ← JumpAwareHead（纯动作 Mamba SSM）
-│   │   ├── fusion.py            ← CrossModalFusion
-│   │   ├── attn.py              ← 注意力辅助模块
-│   │   ├── action_head/
-│   │   │   └── flow_matching.py ← FlowMatchingActionHead（L_flow 内部计算）
-│   │   ├── memory_tree/
-│   │   │   ├── node.py          ← MemoryNode（6-元组）
-│   │   │   ├── tree.py          ← HierarchicalMemoryTree（在线构建）
-│   │   │   ├── operations.py    ← merge / branch / prune / reinforce
-│   │   │   ├── tree_ssm.py      ← TreeSSMReadout（记忆上下文向量）
-│   │   │   └── __init__.py
-│   │   └── sgmts/
-│   │       ├── sgmts.py         ← SGMTS（语义引导 Mamba 树扫描）
-│   │       │                       CLIPPatchExtractor：冻结 CLIP ViT + adapter
-│   │       │                       PatchCNN：轻量 fallback
-│   │       └── __init__.py
-│   ├── losses/
-│   │   ├── tree_losses.py       ← l_boundary, l_sem（预训练）/ stubs
-│   │   └── __init__.py
-│   └── dataset/
-│       ├── robocerebra.py       ← RoboCerebra 预训练数据集
-│       ├── robocerebra_bench.py ← RoboCerebra Bench 评测
-│       └── libero.py            ← LIBERO LeRobot 格式数据集
+├── data/
+│   ├── libero/
+│   │   ├── LIBERO/
+│   │   ├── libero_10/
+│   │   ├── libero_goal/
+│   │   ├── libero_object/
+│   │   └── libero_spatial/
+│   └── RoboCerebra/
+│       ├── RoboCerebraBench/
+│       └── RoboCerebra_trainset/
 │
-├── checkpoints/
-│   ├── Qwen2.5-0.5B/            ← 预训练 LLM（Phase 1/2 默认）
-│   └── Qwen2.5-1.5B-Instruct/  ← 较强 LLM（Phase 2 可选升级）
+├── model_weights/
+│   ├── CLIP/
+│   ├── Evo1_LIBERO/
+│   └── InternVL3-1B/
 │
-└── dataset/
-    ├── RoboCerebra/             ← 预训练数据集
-    │   ├── RoboCerebra_trainset/
-    │   └── RoboCerebraBench/
-    └── LIBERO/                  ← Phase 1/2 数据集
-        ├── libero_object/
-        └── libero_spatial/
+├── logs/
+├── outputs/
+└── results/
 ```
 
 ---
 
+## 结语
 
+如果把 DualTreeVLA 作为论文对象，最准确的表述方式是：
 
-## 参考项目
+- 它是一个围绕 Evo-1 风格骨架构建的双树增强系统
+- 空间端由 SGMTS 提供结构化视觉增强
+- 时间端由 HMT 提供层级记忆组织
+- 当前主实现通过 GateFusion 与记忆 token 追加把双树信息接回骨架
+- 仓库中同时保留了更理想化的策略层与跨模态融合实现，为后续重构和论文抽象提供基础
 
-| 项目 | 贡献 |
-|------|------|
-| [Evo-1](https://github.com/SakanaAI/evo) | 训练脚本风格（AdamW param groups, cosine LR, Accelerate, W&B） |
-| [MemoryVLA](https://github.com/PKU-RL/MemoryVLA) | 记忆树三视角训练范式（ICLR 2026） |
-| [GrootV / MambaTree](https://github.com/GROOT-V) | SGMTS 语义引导 Mamba 树扫描设计 |
-| [Mamba](https://github.com/state-spaces/mamba) | SSM 核心实现（JumpAwareHead 中使用） |
-| [Flow Matching](https://arxiv.org/abs/2210.02747) | FlowMatchingActionHead 理论基础 |
-| [CLIP](https://openai.com/research/clip) | CLIP ViT 视觉骨干预训练权重（CLIPPatchExtractor 中冻结使用） |
-
+这样的写法既能真实反映当前代码，又保留了理论叙述空间，不会在答辩、复现或审稿时被源码反证。

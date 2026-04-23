@@ -1,5 +1,8 @@
-﻿"""
-DualTreeVLA — 主模型 (CONSTRUCTION.md §2.1)
+"""
+DualTreeVLA — 主策略类 (CONSTRUCTION.md §2.1)
+
+从 dual_tree_vla/model/dual_tree_vla.py 迁移至策略层。
+继承 BasePolicy，统一推理接口。
 
 数据流 (单帧):
   task_desc → LLM → g_task (SGMTS) + task_tokens
@@ -11,7 +14,7 @@ DualTreeVLA — 主模型 (CONSTRUCTION.md §2.1)
   JumpAwareHead(A_act_hist, â_1) → p_jump → HMT.insert(z_v_mean, â_1, p_jump>=0.5)
 
 三阶段训练:
-    pretrain  : L_boundary + L_sem (pretrain.py 调用)
+  pretrain  : L_boundary + L_sem (pretrain.py 调用)
   phase1    : L_flow only (LLM+预训练模块冻结)
   phase2    : L_flow only (全量微调)
 """
@@ -26,19 +29,20 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as grad_ckpt
 from transformers import AutoModel, AutoTokenizer
 
-from .memory_tree import (
+from ..model.memory_tree import (
     HierarchicalMemoryTree,
     MLPElevation,
     TreeSSMReadout,
     propagate_elevation_to_root,
 )
-from .sgmts import SGMTSEncoder
-from .fusion import CrossModalFusion
-from .action_head import FlowMatchingActionHead
-from .semantic_jump_head import JumpAwareHead
+from ..model.sgmts import SGMTSEncoder
+from ..model.common.fusion import CrossModalFusion
+from ..model.action_head import FlowMatchingActionHead
+from ..model.common.semantic_jump_head import JumpAwareHead
+from .base_policy import BasePolicy
 
 
-class DualTreeVLA(nn.Module):
+class DualTreeVLA(BasePolicy):
     """
     Parameters
     ----------
@@ -118,11 +122,11 @@ class DualTreeVLA(nn.Module):
         self.sgmts = SGMTSEncoder(
             d_f=d_visual,
             d_lang=d_lang,
-            d_hidden=d,        # HMT node embedding dim
+            d_hidden=d,
             d_visual=d_visual,
             patch_size=patch_size,
             d_state=d_state,
-            clip_model_name=clip_model_name,  # None → PatchCNN；非 None → 冻结 CLIP ViT
+            clip_model_name=clip_model_name,
         )
 
         # ── JumpAwareHead ─────────────────────────────────────────────
@@ -164,6 +168,25 @@ class DualTreeVLA(nn.Module):
         self._tree_K_elev = int(K_elev)
         self._tree_delta_w = float(delta_w)
         self._tree_mount_tau = float(mount_tau)
+
+    # ---------------------------------------------------------------- #
+    #  BasePolicy interface                                             #
+    # ---------------------------------------------------------------- #
+
+    def predict_action(
+        self,
+        image: torch.Tensor,
+        instruction: str,
+        state: torch.Tensor,
+        a_prev: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """单步推理接口（实现 BasePolicy 抽象方法）。"""
+        a_pred = self.step(image, instruction, state, a_prev)
+        return {"action": a_pred}
+
+    def reset(self, batch_size: int = 1) -> None:
+        """重置记忆树（实现 BasePolicy 接口）。"""
+        self.reset_trees(batch_size)
 
     # ---------------------------------------------------------------- #
     #  Tree management                                                  #
@@ -213,8 +236,8 @@ class DualTreeVLA(nn.Module):
         """(1, L, d_a) float tensor of active node action history. L=0 if empty."""
         if active_node is None or not active_node.a_hist:
             return torch.zeros(1, 0, self.d_a, device=device)
-        stacked = torch.stack(active_node.a_hist, dim=0).to(device)   # (L, d_a)
-        return stacked.unsqueeze(0)                                     # (1, L, d_a)
+        stacked = torch.stack(active_node.a_hist, dim=0).to(device)
+        return stacked.unsqueeze(0)
 
     def _get_s_top(
         self,
@@ -222,10 +245,7 @@ class DualTreeVLA(nn.Module):
         device: torch.device,
         dtype: torch.dtype,
     ) -> Optional[torch.Tensor]:
-        """
-        Return mean of the top-2 abstract nodes' s embeddings, or None.
-        Top = BFS-depth ≤ 1 non-leaf nodes with s != None.
-        """
+        """Return mean of the top-2 abstract nodes' s embeddings, or None."""
         bfs = tree.bfs_order()
         abstracts = []
         for nid in bfs:
@@ -243,7 +263,6 @@ class DualTreeVLA(nn.Module):
         if tree.root_id is None or tree.size() < 3:
             return 1.0
         max_depth = max(tree.depth(nid) for nid in tree.nodes)
-        # decay: β = max(0.3, 1.0 - 0.7 * depth/5)
         return max(0.3, 1.0 - 0.14 * max_depth)
 
     def _encode_language(
@@ -271,7 +290,7 @@ class DualTreeVLA(nn.Module):
     def _compute_flow_loss(
         self,
         all_Z_fused: List[torch.Tensor],
-        actions: torch.Tensor,   # (B, T, d_a)
+        actions: torch.Tensor,
         device: torch.device,
     ) -> torch.Tensor:
         B, T, _ = actions.shape
@@ -299,14 +318,14 @@ class DualTreeVLA(nn.Module):
 
     def _compute_boundary_labels(
         self,
-        actions: torch.Tensor,   # (B, T, d_a)
+        actions: torch.Tensor,
         device: torch.device,
         gamma: float = 2.0,
     ) -> torch.Tensor:
         """Self-supervised boundary labels: y_t = 1[||a_t - ā|| > γ·σ]. Returns (B*T,)."""
         B, T, _ = actions.shape
         a_mean = actions.mean(dim=1, keepdim=True)
-        gap    = (actions - a_mean).norm(dim=-1)           # (B, T)
+        gap    = (actions - a_mean).norm(dim=-1)
         sigma  = gap.std(dim=1, keepdim=True).clamp(min=1e-6)
         y      = (gap > gamma * sigma).float()
         return y.reshape(-1).to(device)
@@ -318,51 +337,40 @@ class DualTreeVLA(nn.Module):
     @torch.no_grad()
     def step(
         self,
-        image: torch.Tensor,           # (1, C, H, W)
+        image: torch.Tensor,
         instruction: str,
-        q: torch.Tensor,               # (1, d_q)
-        a_prev: Optional[torch.Tensor] = None,  # (1, d_a) — previous GT or predicted action
-    ) -> torch.Tensor:                 # (1, H_a, d_a)
+        q: torch.Tensor,
+        a_prev: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         device = image.device
         tree   = self.get_tree(0)
 
-        # 1. Language
-        _, g_lang = self._encode_language([instruction], device)   # (1, d_lang)
-
-        # 2. s_top from HMT
+        _, g_lang = self._encode_language([instruction], device)
         s_top  = self._get_s_top(tree, device, g_lang.dtype)
         beta_v = self._compute_beta(tree)
 
-        # 3. SGMTS
-        Z_v     = self.sgmts(image, g_lang, [s_top], [beta_v])   # (1, P, d_visual)
-        z_v_mean = Z_v.mean(1).squeeze(0)                         # (d_visual,)
+        Z_v      = self.sgmts(image, g_lang, [s_top], [beta_v])
+        z_v_mean = Z_v.mean(1).squeeze(0)
 
-        # 4. TreeSSM readout（取最后一个语义token作为 m_ctx）
-        Z_M = self.tree_ssm(tree, device=device)                   # (N_M, d_ssm)
-        m_ctx = Z_M[-1].unsqueeze(0)                               # (1, d_ssm)
+        Z_M   = self.tree_ssm(tree, device=device)
+        m_ctx = Z_M[-1].unsqueeze(0)
         pad_q = q
         if pad_q.shape[1] < self.d_q:
             pad_q = F.pad(pad_q, (0, self.d_q - pad_q.shape[1]))
         elif pad_q.shape[1] > self.d_q:
             pad_q = pad_q[:, :self.d_q]
 
-        # 5. Fusion
-        Z_fused = self.fusion(z_v_mean.unsqueeze(0), m_ctx, g_lang, pad_q)  # (1, 1, d)
-        # Broaden context: [fused_vec | SGMTS patch tokens] → (1, 1+P, d)
-        ctx = torch.cat([Z_fused, Z_v], dim=1)                              # (1, 1+P, d)
+        Z_fused = self.fusion(z_v_mean.unsqueeze(0), m_ctx, g_lang, pad_q)
+        ctx = torch.cat([Z_fused, Z_v], dim=1)
 
-        # 6. Flow matching prediction
-        a_pred  = self.action_head.sample(ctx, device=device)        # (1, H_a, d_a)
-        a_hat_1 = a_pred[:, 0]                                     # (1, d_a)
+        a_pred  = self.action_head.sample(ctx, device=device)
+        a_hat_1 = a_pred[:, 0]
 
-        # 7. JumpAwareHead → p_jump
         active_node = tree.nodes.get(tree.active_id) if tree.active_id is not None else None
-        A_act = self._get_A_act_tensor(active_node, device)        # (1, L, d_a)
+        A_act = self._get_A_act_tensor(active_node, device)
         p_jump, _ = self.jump_head(A_act, a_hat_1)
         force_branch = bool(p_jump.item() >= 0.5)
 
-        # 8. Update HMT
-        # 先用 mlp_elev 计算当前帧语义供挂载点搜索（no_grad，仅用于树结构决策）
         s_current = self.mlp_elev(
             z_v_mean.unsqueeze(0).float()
         ).squeeze(0).detach().cpu()
@@ -381,10 +389,10 @@ class DualTreeVLA(nn.Module):
 
     def forward(
         self,
-        images: torch.Tensor,           # (B, T, C, H, W)
+        images: torch.Tensor,
         instructions: List[str],
-        states: torch.Tensor,           # (B, T, d_q)
-        actions: torch.Tensor,          # (B, T, d_a)
+        states: torch.Tensor,
+        actions: torch.Tensor,
         episode_ids: Optional[torch.Tensor] = None,
         frame_indices: Optional[torch.Tensor] = None,
         subtask_ids: Optional[torch.Tensor] = None,
@@ -405,32 +413,27 @@ class DualTreeVLA(nn.Module):
         compute_flow = (mode in ("phase1", "phase2"))
         compute_jump = (mode == "pretrain")
 
-        # step-level training (T=1) keeps one persistent tree per episode id.
-        # sequence training / pretrain keeps legacy behavior (reset per batch).
         use_episode_persistent_tree = (
             episode_ids is not None and frame_indices is not None and T == 1 and compute_flow
         )
         if not use_episode_persistent_tree:
             self.reset_trees(B)
 
-        # Shared language encoding
-        _, g_lang = self._encode_language(instructions, device)    # (B, d_lang)
+        _, g_lang = self._encode_language(instructions, device)
 
         all_Z_fused: List[torch.Tensor] = []
         jump_logits: List[torch.Tensor] = []
 
         for t in range(T):
-            imgs_t = images[:, t]          # (B, C, H, W)
-            q_t    = states[:, t]          # (B, T, d_q)
-            a_t    = actions[:, t]         # (B, d_a)
+            imgs_t = images[:, t]
+            q_t    = states[:, t]
+            a_t    = actions[:, t]
 
-            # Pad/truncate q
             if q_t.shape[1] < self.d_q:
                 q_t = F.pad(q_t, (0, self.d_q - q_t.shape[1]))
             elif q_t.shape[1] > self.d_q:
                 q_t = q_t[:, :self.d_q]
 
-            # s_top and β per sample
             s_top_list = []
             beta_list  = []
             tree_keys: List[int] = []
@@ -448,31 +451,27 @@ class DualTreeVLA(nn.Module):
                 s_top_list.append(s_top_b)
                 beta_list.append(self._compute_beta(tree_b))
 
-            # SGMTS
             if self.training:
                 Z_v_t = grad_ckpt(
                     self.sgmts, imgs_t, g_lang, s_top_list, beta_list,
                     use_reentrant=False,
                 )
             else:
-                Z_v_t = self.sgmts(imgs_t, g_lang, s_top_list, beta_list)   # (B, P, d_visual)
+                Z_v_t = self.sgmts(imgs_t, g_lang, s_top_list, beta_list)
             assert Z_v_t is not None
 
-            z_v_mean_t = Z_v_t.mean(1)   # (B, d_visual)
+            z_v_mean_t = Z_v_t.mean(1)
 
-            # Per-sample: JumpAwareHead + tree update
             m_ctx_list = []
             for b in range(B):
                 tree_b      = self.get_tree(tree_keys[b])
                 active_node = tree_b.nodes.get(tree_b.active_id) if tree_b.active_id is not None else None
-                A_act_b     = self._get_A_act_tensor(active_node, device)  # (1, L, d_a)
+                A_act_b     = self._get_A_act_tensor(active_node, device)
 
-                # During training always use GT action for jump + insert (teacher forcing)
                 p_j, logit_j = self.jump_head(A_act_b, a_t[b:b+1])
                 if compute_jump:
                     jump_logits.append(logit_j)
 
-                # 预训练阶段：优先用 GT subtask_ids 强制分支，保证树结构与标注一致
                 if compute_jump and subtask_ids is not None:
                     gt_branch = False
                     if t > 0:
@@ -480,7 +479,7 @@ class DualTreeVLA(nn.Module):
                     force_branch = gt_branch
                 else:
                     force_branch = bool(p_j.detach().item() >= 0.5)
-                # 计算当前帧语义供挂载点搜索（no_grad，仅用于树结构决策）
+
                 with torch.no_grad():
                     s_current_b = self.mlp_elev(
                         z_v_mean_t[b].unsqueeze(0).float()
@@ -494,45 +493,34 @@ class DualTreeVLA(nn.Module):
                     tree_b._prune_to_max_depth(self.max_tree_depth)
                     tree_b.elevation_pending_parent = None
 
-                Z_M_b = self.tree_ssm(tree_b, device=device)   # (N_M, d_ssm)
-                # When tree has no abstract nodes (step_level training: tree reset
-                # each forward, T=1 → only 1 leaf, s=None → TreeSSMReadout returns
-                # zeros), fall back to z_v_mean as a meaningful memory proxy so
-                # CrossModalFusion and tree_ssm parameters receive useful gradients.
+                Z_M_b = self.tree_ssm(tree_b, device=device)
                 m_ctx_b = Z_M_b[-1]
                 if tree_b.size() <= 1:
-                    # Project visual mean into d_ssm space via tree_ssm's abs_in_proj:
-                    # use a detached proxy so the fallback doesn't interfere with the
-                    # tree_ssm output gradient path.
                     m_ctx_b = z_v_mean_t[b].detach()[:self.tree_ssm.d_ssm]
                     if m_ctx_b.shape[0] < self.tree_ssm.d_ssm:
                         m_ctx_b = F.pad(m_ctx_b, (0, self.tree_ssm.d_ssm - m_ctx_b.shape[0]))
                 m_ctx_list.append(m_ctx_b)
 
-            m_ctx_t = torch.stack(m_ctx_list, dim=0)           # (B, d_ssm)
-            Z_fused_t = self.fusion(z_v_mean_t, m_ctx_t, g_lang, q_t)   # (B, 1, d)
-            # Broaden context: [fused_vec | SGMTS patch tokens] → (B, 1+P, d)
-            ctx_t = torch.cat([Z_fused_t, Z_v_t], dim=1)                # (B, 1+P, d)
+            m_ctx_t = torch.stack(m_ctx_list, dim=0)
+            Z_fused_t = self.fusion(z_v_mean_t, m_ctx_t, g_lang, q_t)
+            ctx_t = torch.cat([Z_fused_t, Z_v_t], dim=1)
             if not compute_flow:
                 ctx_t = ctx_t.detach()
             all_Z_fused.append(ctx_t)
 
         torch.cuda.empty_cache()
 
-        # ── Phase 1 / 2: flow loss ────────────────────────────────────
         if compute_flow:
             L_flow = self._compute_flow_loss(all_Z_fused, actions, device)
             return {"L_flow": L_flow, "total": L_flow}
 
-        # ── Pretrain: boundary + semantic losses ─────────────────────
         if compute_jump and jump_logits:
             from dual_tree_vla.losses.tree_losses import l_boundary, l_sem
 
-            logits_t = torch.cat(jump_logits, dim=0)          # (B*T,)
+            logits_t = torch.cat(jump_logits, dim=0)
             y_act    = self._compute_boundary_labels(actions, device)
             L_bnd    = l_boundary(logits_t, y_act)
 
-            # L_sem: abstract node semantics vs subtask text embeddings
             L_sem = torch.zeros((), device=device)
             if subtask_ids is not None:
                 s_nodes_list, s_text_list = [], []
@@ -544,7 +532,7 @@ class DualTreeVLA(nn.Module):
                     descs = ([instructions[b]]
                              if subtask_descs is None or b >= len(subtask_descs) or not subtask_descs[b]
                              else subtask_descs[b])
-                    g_sub = self._encode_text_descs(descs, device).to(dtype=sem_dtype)  # (S, d_lang)
+                    g_sub = self._encode_text_descs(descs, device).to(dtype=sem_dtype)
                     for nid, node in tree_b.nodes.items():
                         if node.is_leaf() or node.s is None:
                             continue
@@ -567,3 +555,7 @@ class DualTreeVLA(nn.Module):
             }
 
         return {"total": torch.zeros((), device=device)}
+
+
+# 向后兼容别名
+DualTreePolicy = DualTreeVLA

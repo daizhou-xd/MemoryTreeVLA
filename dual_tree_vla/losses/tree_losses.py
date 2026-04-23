@@ -56,11 +56,22 @@ def l_sem(
     s_text: torch.Tensor,
     temperature: float = 0.07,
 ) -> torch.Tensor:
-    """Symmetric InfoNCE between node semantics and text semantics."""
+    """
+    语义对齐损失。
+
+    - 若 s_text 的所有行都相同（单样本场景），退化为余弦对齐损失：
+        loss = mean(1 - cos(s_nodes[i], s_text[0]))
+    - 若 s_text 的行各不相同（跨轨迹 InfoNCE 场景），使用对称 InfoNCE。
+    """
     if s_nodes.shape[0] == 0:
         return s_nodes.new_zeros(1).squeeze()
     s_n = F.normalize(s_nodes, dim=-1)
     s_t = F.normalize(s_text, dim=-1)
+    # 判断所有文本向量是否相同（单样本退化场景）
+    if s_t.shape[0] <= 1 or (s_t - s_t[0:1]).abs().max() < 1e-6:
+        # 余弦对齐：拉近每个节点与任务描述
+        return (1.0 - (s_n * s_t[0:1]).sum(dim=-1)).mean()
+    # 跨轨迹 InfoNCE（需要不同任务的文本作为负样本）
     logits = (s_n @ s_t.T) / temperature
     targets = torch.arange(logits.shape[0], device=logits.device)
     return 0.5 * (F.cross_entropy(logits, targets) + F.cross_entropy(logits.T, targets))

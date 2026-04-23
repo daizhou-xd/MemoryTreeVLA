@@ -1,3 +1,3 @@
-from .sgmts import SGMTSEncoder, PatchCNN
+from .sgmts import SGMTS, SGMTSEncoder
 
-__all__ = ["SGMTSEncoder", "PatchCNN"]
+__all__ = ["SGMTS", "SGMTSEncoder"]

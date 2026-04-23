@@ -8,8 +8,11 @@
 # ────────────────────────────────────────────────────────────────────────
 set -e
 
+# 若 Evo-1 未与 DualTreeVLA 处于常见同级目录，请手动设置其路径：
+# export PYTHONPATH="${PYTHONPATH}:/path/to/Evo-1/Evo-1"
+
 NUM_GPUS=${1:-8}
-CONFIG=configs/pretrain.yaml
+CONFIG=dual_tree_vla/config/pretrain.yaml
 
 echo "[pretrain.sh] GPUs=$NUM_GPUS  config=$CONFIG"
 
@@ -17,5 +20,5 @@ accelerate launch \
     --num_processes $NUM_GPUS \
     --mixed_precision bf16 \
     --dynamo_backend no \
-    scripts/pretrain.py \
+    pretrain.py \
         --config "$CONFIG"

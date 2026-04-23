@@ -11,7 +11,7 @@ deepspeed:
 
 # ── Data ──────────────────────────────────────────────────────────
 data:
-  root:        "dataset/RoboCerebra/RoboCerebra_trainset"
+  root:        "data/RoboCerebra/RoboCerebra_trainset"
   scenes:      null      # null = all scenes
   img_h:       224
   img_w:       224
@@ -20,9 +20,9 @@ data:
 
 # ── Model ─────────────────────────────────────────────────────────
 model:
-  llm_path:    "checkpoints/Qwen2.5-0.5B"
+  vlm_path:    "model_weights/InternVL3-1B"    # InternVL3-1B 本地路径（云服务器上请修改为实际绝对路径）
   # CLIP视觉骨干（推荐）：填入 HuggingFace 模型 ID，留空则使用 PatchCNN fallback
-  clip_model_name: "checkpoints/CLIP/clip-vit-base-patch16"
+  clip_model_name: "model_weights/CLIP/clip-vit-base-patch16"
   d:           256       # unified embedding dim
   d_a:         7         # action dim (Franka: 6D Δ-pose + gripper)
   d_q:         84        # proprioceptive state dim
@@ -47,7 +47,7 @@ train:
   epochs:        50
   lr:            1.0e-4
   weight_decay:  1.0e-4
-  ckpt_dir:      "checkpoints/runs"
+  ckpt_dir:      "data/outputs"
   save_every:    5
 
 # ── Loss weights ──────────────────────────────────────────────────

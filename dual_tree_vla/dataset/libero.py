@@ -70,6 +70,8 @@ except ImportError:
 # ================================================================
 
 def _decode_image_bytes(raw: bytes, h: int, w: int) -> np.ndarray:
+    if not raw:
+        return np.zeros((h, w, 3), dtype=np.uint8)
     if _PIL_AVAILABLE:
         img = PILImage.open(io.BytesIO(raw)).convert("RGB")
         if img.size != (w, h):
@@ -457,20 +459,29 @@ class LiberoDataset(Dataset):
                 self._episode_cache.popitem(last=False)
         cached = self._episode_cache[record_idx]
 
-        img_bytes: List[bytes] = cached["img_bytes"]
-        a_raw: np.ndarray      = cached["a_raw"]    # (T, d_a) float32
-        s_raw: np.ndarray      = cached["s_raw"]    # (T, d_q) float32
-        instruction: str       = cached["instruction"]
+        img_bytes_views: List[List[bytes]] = cached["img_bytes_views"]
+        a_raw: np.ndarray                  = cached["a_raw"]    # (T, d_a) float32
+        s_raw: np.ndarray                  = cached["s_raw"]    # (T, d_q) float32
+        instruction: str                   = cached["instruction"]
         T = len(a_raw)
+        num_views = max(len(img_bytes_views), 1)
+        image_mask = torch.zeros(num_views, dtype=torch.bool)
 
         # ── Step-level return (Evo-1 style) ─────────────────────────
         if frame_t is not None:
             # Decode only ONE frame — O(1) JPEG decode instead of O(T)
-            if img_bytes and frame_t < len(img_bytes):
-                frm_np = _decode_image_bytes(img_bytes[frame_t], self.img_h, self.img_w)
-            else:
-                frm_np = np.zeros((self.img_h, self.img_w, 3), np.uint8)
-            fr_t = torch.from_numpy(frm_np.astype(np.float32) / 255.0).permute(2, 0, 1)
+            frame_views = []
+            for view_idx in range(num_views):
+                view_bytes = img_bytes_views[view_idx] if view_idx < len(img_bytes_views) else []
+                if frame_t < len(view_bytes) and view_bytes[frame_t]:
+                    frm_np = _decode_image_bytes(view_bytes[frame_t], self.img_h, self.img_w)
+                    image_mask[view_idx] = True
+                else:
+                    frm_np = np.zeros((self.img_h, self.img_w, 3), np.uint8)
+                frame_views.append(frm_np)
+            fr_t = torch.from_numpy(
+                np.stack(frame_views, axis=0).astype(np.float32) / 255.0
+            ).permute(0, 3, 1, 2)
 
             t_end   = min(frame_t + self.H_a, T)
             a_chunk = torch.from_numpy(a_raw[frame_t:t_end].copy())
@@ -479,25 +490,40 @@ class LiberoDataset(Dataset):
                     [a_chunk, a_chunk[-1:].expand(self.H_a - a_chunk.shape[0], -1)]
                 )
             return {
-                "frames":      fr_t.unsqueeze(0),                         # (1, 3, H, W)
+                "frames":      fr_t.unsqueeze(0),                         # (1, V, 3, H, W)
                 "actions":     a_chunk,                                   # (H_a, d_a)
                 "states":      torch.from_numpy(s_raw[frame_t].copy()).unsqueeze(0),  # (1, d_q)
+                "image_mask":  image_mask,
                 "instruction": instruction,
                 "episode_id":  int(record_idx),
                 "frame_idx":   int(frame_t),
             }
 
         # ── Episode-level return (viz / backward-compat) ────────────
-        if img_bytes:
-            frames_np = np.stack(
-                [_decode_image_bytes(b, self.img_h, self.img_w) for b in img_bytes]
-            )
-        else:
-            frames_np = np.zeros((T, self.img_h, self.img_w, 3), np.uint8)
-        fr = torch.from_numpy(frames_np.astype(np.float32) / 255.0).permute(0, 3, 1, 2)
+        frames_np_views = []
+        for view_idx in range(num_views):
+            view_bytes = img_bytes_views[view_idx] if view_idx < len(img_bytes_views) else []
+            if view_bytes:
+                frames_np = np.stack(
+                    [_decode_image_bytes(b, self.img_h, self.img_w) for b in view_bytes]
+                )
+                image_mask[view_idx] = True
+            else:
+                frames_np = np.zeros((T, self.img_h, self.img_w, 3), np.uint8)
+            frames_np_views.append(frames_np)
+        frames_np = np.stack(frames_np_views, axis=1) if frames_np_views else np.zeros(
+            (T, 1, self.img_h, self.img_w, 3), np.uint8
+        )
+        fr = torch.from_numpy(frames_np.astype(np.float32) / 255.0).permute(0, 1, 4, 2, 3)
         ac = torch.from_numpy(a_raw[:T].copy())
         st = torch.from_numpy(s_raw[:T].copy())
-        return {"frames": fr, "actions": ac, "states": st, "instruction": instruction}
+        return {
+            "frames": fr,
+            "actions": ac,
+            "states": st,
+            "image_mask": image_mask,
+            "instruction": instruction,
+        }
 
     def _cache_episode(self, record_idx: int) -> Dict:
         """
@@ -561,34 +587,43 @@ class LiberoDataset(Dataset):
             instruction = str(df[i_col].iloc[0]) if i_col else ""
 
         # ── Image bytes (store compressed; decode per-step in _load_episode) ─
-        _im_candidates = ["observation.images.image", "observation.image", "image"]
-        img_bytes: List[bytes] = []
+        view_candidates = [
+            ["observation.images.image", "observation.image", "image"],
+            ["observation.images.wrist_image", "observation.wrist_image", "wrist_image"],
+        ]
+        img_bytes_views: List[List[bytes]] = []
         if layout == "B":
             # lerobot v2: decode from video, then re-compress to JPEG bytes
             frames_np = self._load_frames_from_video(record, root_p)
             if frames_np.shape[0] > 0:
+                primary_view: List[bytes] = []
                 if _PIL_AVAILABLE:
                     for frm in frames_np:
                         buf = io.BytesIO()
                         PILImage.fromarray(frm).save(buf, format="JPEG", quality=85)
-                        img_bytes.append(buf.getvalue())
+                        primary_view.append(buf.getvalue())
                 else:
                     # cv2 fallback: store raw RGB bytes (larger but avoids PIL dep)
-                    img_bytes = [frm.tobytes() for frm in frames_np]
+                    primary_view = [frm.tobytes() for frm in frames_np]
+                img_bytes_views.append(primary_view)
             else:
-                im_col = self._col(df, _im_candidates)
-                if im_col:
-                    img_bytes = [_extract_image_raw(r) for r in df[im_col].tolist()]
+                for candidates in view_candidates:
+                    im_col = self._col(df, candidates)
+                    if im_col:
+                        img_bytes_views.append([_extract_image_raw(r) for r in df[im_col].tolist()])
         else:
             # Layout A / C: images already inline as JPEG bytes
-            im_col = self._col(df, _im_candidates)
-            if im_col:
-                img_bytes = [_extract_image_raw(r) for r in df[im_col].tolist()]
+            for candidates in view_candidates:
+                im_col = self._col(df, candidates)
+                if im_col:
+                    img_bytes_views.append([_extract_image_raw(r) for r in df[im_col].tolist()])
+        if not img_bytes_views:
+            img_bytes_views = [[]]
 
         return {
-            "img_bytes":   img_bytes,   # List[bytes], one JPEG blob per frame
-            "a_raw":       a_raw,       # (T, d_a) float32
-            "s_raw":       s_raw,       # (T, d_q) float32
+            "img_bytes_views": img_bytes_views,  # List[List[bytes]], outer dim = views
+            "a_raw":           a_raw,            # (T, d_a) float32
+            "s_raw":           s_raw,            # (T, d_q) float32
             "instruction": instruction,
         }
 
@@ -632,11 +667,19 @@ def libero_collate(batch: List[Dict]) -> Dict:
     T_frames  = max(b["frames"].shape[0]  for b in batch)
     T_actions = max(b["actions"].shape[0] for b in batch)
     B         = len(batch)
-    C, H, W   = batch[0]["frames"].shape[1:]
     d_a       = batch[0]["actions"].shape[1]
     d_q       = batch[0]["states"].shape[1]
+    frame_ndim = batch[0]["frames"].ndim
 
-    frames  = torch.zeros(B, T_frames,  C, H, W)
+    if frame_ndim == 5:
+        V_max     = max(b["frames"].shape[1] for b in batch)
+        C, H, W   = batch[0]["frames"].shape[2:]
+        frames    = torch.zeros(B, T_frames, V_max, C, H, W)
+        image_masks = torch.zeros(B, V_max, dtype=torch.bool)
+    else:
+        C, H, W   = batch[0]["frames"].shape[1:]
+        frames    = torch.zeros(B, T_frames, C, H, W)
+        image_masks = torch.ones(B, 1, dtype=torch.bool)
     actions = torch.zeros(B, T_actions, d_a)
     states  = torch.zeros(B, T_frames,  d_q)
     episode_ids = torch.full((B,), -1, dtype=torch.long)
@@ -646,11 +689,18 @@ def libero_collate(batch: List[Dict]) -> Dict:
     for i, s in enumerate(batch):
         Tf = s["frames"].shape[0]
         Ta = s["actions"].shape[0]
-        frames[i, :Tf]  = s["frames"]
+        if frame_ndim == 5:
+            Vi = s["frames"].shape[1]
+            frames[i, :Tf, :Vi] = s["frames"]
+            if Tf < T_frames:
+                frames[i, Tf:, :Vi] = s["frames"][-1:].expand(T_frames - Tf, -1, -1, -1, -1)
+            image_masks[i, :Vi] = s.get("image_mask", torch.ones(Vi, dtype=torch.bool))
+        else:
+            frames[i, :Tf] = s["frames"]
+            if Tf < T_frames:
+                frames[i, Tf:] = s["frames"][-1:].expand(T_frames - Tf, -1, -1, -1)
         actions[i, :Ta] = s["actions"]
         states[i, :Tf]  = s["states"]
-        if Tf < T_frames:
-            frames[i, Tf:] = s["frames"][-1:].expand(T_frames - Tf, -1, -1, -1)
         if "episode_id" in s:
             episode_ids[i] = int(s["episode_id"])
         if "frame_idx" in s:
@@ -661,6 +711,7 @@ def libero_collate(batch: List[Dict]) -> Dict:
         "frames": frames,
         "actions": actions,
         "states": states,
+        "image_masks": image_masks,
         "instructions": instructions,
         "episode_ids": episode_ids,
         "frame_indices": frame_indices,

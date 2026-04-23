@@ -1,6 +1,7 @@
 # Evo-1 代码库深度分析
 
-> 目的：记录 Evo-1（`D:\Github_Project\Evo1_Project\Evo-1\Evo-1\`）的架构与实现细节，
+> 目的：记录 Evo-1 的架构与实现细节。
+> 本文档最初参考本地路径 `D:\Github_Project\Evo1_Project\Evo-1\Evo-1\`，但该路径仅用于离线对照，不是 DualTreeVLA 在云服务器上的运行依赖。
 > 作为 DualTreeVLA 对标 / 改进的基准。
 > 每次发现新差异请在本文件末尾追加。
 

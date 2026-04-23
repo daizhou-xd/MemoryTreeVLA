@@ -11,7 +11,7 @@
 - **conda 环境**：`dualtree`
 - **硬件**：8× RTX A6000
 - **基架**：在 Evo-1 (InternVL3+FlowMatching) 基础上，加入 DualMemoryTree + SGMTS 视觉模块
-- **Evo-1 参考路径**：`D:\Github_Project\Evo1_Project\Evo-1\Evo-1\`
+- **Evo-1 参考实现**：本地开发阶段曾对照 `D:\Github_Project\Evo1_Project\Evo-1\Evo-1\`，但该路径仅用于代码比对，不是 DualTreeVLA 在云服务器上的运行依赖；运行时主体已迁移到本仓内部实现。
 
 ---
 

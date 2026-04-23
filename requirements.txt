@@ -8,6 +8,7 @@ torchvision>=0.16.0
 # ── LLM / Tokenizer ───────────────────────────────────────────────
 transformers>=4.40.0,<4.45.0
 accelerate>=0.28.0
+timm>=0.9.0          # InternVL3 ViT 依赖（modeling_intern_vit.py 中使用 timm.layers.DropPath）
 
 # ── DeepSpeed (multi-GPU) ─────────────────────────────────────────
 deepspeed>=0.14.0,<0.15.0
